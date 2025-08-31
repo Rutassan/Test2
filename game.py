@@ -200,6 +200,23 @@ class Map:
         return m
 
 
+class Item:
+    def __init__(self, x: int, y: int, kind: str):
+        self.x = x
+        self.y = y
+        self.kind = kind
+
+    def pos(self) -> Tuple[int, int]:
+        return (self.x, self.y)
+
+    def serialize(self) -> Dict[str, Any]:
+        return {"x": int(self.x), "y": int(self.y), "kind": str(self.kind)}
+
+    @staticmethod
+    def deserialize(data: Dict[str, Any]) -> "Item":
+        return Item(int(data.get("x", 0)), int(data.get("y", 0)), str(data.get("kind", "potion")))
+
+
 class Entity:
     def __init__(self, x: int, y: int, ch: str, color_visible: str, color_dim: str, name: str, hp: int, power: int):
         self.x = x
@@ -238,13 +255,18 @@ class Entity:
 
 class Game:
     def __init__(self):
-        self.state: str = "menu"  # menu, playing, paused, game_over
+        self.state: str = "menu"  # menu, playing, paused, game_over, victory
         self.turn: int = 0
         self.seed: int = 1337
         self.rng = random.Random(self.seed)
         self.map = Map(DEFAULT_W, DEFAULT_H)
         self.player = Entity(0, 0, "@", FG_BRIGHT_WHITE, FG_BRIGHT_WHITE, "Player", 20, 5)
         self.enemies: List[Entity] = []
+        # Map features and items
+        self.exit_x: Optional[int] = None
+        self.exit_y: Optional[int] = None
+        self.items: List[Item] = []
+        self.inventory: Dict[str, int] = {"potion": 0}
         self.visible: List[List[bool]] = [[False for _ in range(self.map.w)] for _ in range(self.map.h)]
         self.logger = Logger()
         # Menu settings
@@ -282,8 +304,16 @@ class Game:
         self._auto_target_desc: Optional[str] = None
         self._auto_path: Optional[List[Tuple[int, int]]] = None  # full path including next cells
         # Optional behaviors
-        self.auto_restart_on_death: bool = False
-        self.auto_restart_on_victory: bool = False
+        self.auto_restart_on_death: bool = True
+        self.auto_restart_on_victory: bool = True
+        self.auto_restart_delay_ms: int = 800
+        # Batch mode guard (GUI uses it to suppress modals)
+        self._series_mode: bool = False
+        # Run metrics
+        self.run_kills: int = 0
+        self.run_dmg_dealt: int = 0
+        self.run_dmg_taken: int = 0
+        self.run_items_used: int = 0
 
     def random_enemy(self) -> Entity:
         """Return a newly created random enemy Entity using internal RNG.
@@ -322,6 +352,12 @@ class Game:
         self.place_entity_random_floor(self.player)
         # Place enemies
         self.enemies = []
+        # Place exit and items/inventory
+        self._place_exit_pending = False  # internal guard
+        # Exit will be placed after player placement
+        # Clear items and inventory
+        self.items = []
+        self.inventory = {"potion": 0}
         # Clear ephemeral/visual-only state
         self.damage_events = []
         self.corpses = []
@@ -329,12 +365,71 @@ class Game:
             e = self.random_enemy()
             self.place_entity_random_floor(e, avoid=[self.player] + self.enemies)
             self.enemies.append(e)
+        # Place exit now that player and enemies are positioned
+        self._place_exit()
+        # Spawn potions
+        self._spawn_potions()
+        # Reset run metrics
+        self.run_kills = 0
+        self.run_dmg_dealt = 0
+        self.run_dmg_taken = 0
+        self.run_items_used = 0
         if is_restart:
             self.logger.log("Restarted.")
         else:
             self.logger.log(f"New game. Seed={self.seed}")
         self.state = "playing"
         self.recompute_fov()
+
+    def _place_exit(self):
+        # Choose a walkable farthest tile from player
+        px, py = self.player.x, self.player.y
+
+        # 0) If low HP and have potion -> use it
+        try:
+            if self.player.hp <= max(1, int(self.player.max_hp * 0.4)) and self.inventory.get("potion", 0) > 0:
+                return ("use_potion", None, None, "use potion")
+        except Exception:
+            pass
+        best: Optional[Tuple[int, int]] = None
+        best_d = -1
+        for y in range(1, self.map.h - 1):
+            for x in range(1, self.map.w - 1):
+                if not self.map.is_walkable(x, y):
+                    continue
+                if (x, y) == (px, py):
+                    continue
+                d = abs(x - px) + abs(y - py)
+                if d > best_d:
+                    best_d = d
+                    best = (x, y)
+        if best is None:
+            self.exit_x = None
+            self.exit_y = None
+        else:
+            self.exit_x, self.exit_y = best
+
+    def _spawn_potions(self):
+        count = self.rng.randint(2, 4)
+        cx, cy = self.map.w // 2, self.map.h // 2
+        tries = 0
+        while count > 0 and tries < 2000:
+            tries += 1
+            x = self.rng.randrange(1, self.map.w - 1)
+            y = self.rng.randrange(1, self.map.h - 1)
+            if not self.map.is_walkable(x, y):
+                continue
+            if (x, y) == (self.player.x, self.player.y):
+                continue
+            if any(e.is_alive() and (e.x, e.y) == (x, y) for e in self.enemies):
+                continue
+            # Bias towards center
+            dist = math.hypot(x - cx, y - cy)
+            maxd = math.hypot(cx, cy) + 1e-6
+            p = 1.0 - (dist / maxd)
+            if self.rng.random() < p:
+                self.items.append(Item(x, y, "potion"))
+                count -= 1
 
     def place_entity_random_floor(self, ent: Entity, avoid: Optional[List[Entity]] = None):
         if avoid is None:
@@ -426,6 +521,11 @@ class Game:
                     target = self.player
             if target is None:
                 ent.x, ent.y = nx, ny
+                if ent is self.player:
+                    # Pickup items and check exit
+                    self._pickup_items_at(nx, ny)
+                    if self.exit_x is not None and self.exit_y is not None and (nx, ny) == (self.exit_x, self.exit_y):
+                        self._on_victory()
             else:
                 if attack_on_block:
                     self.attack(ent, target)
@@ -473,6 +573,17 @@ class Game:
                 except Exception:
                     pass
 
+        # Track run metrics
+        try:
+            if attacker is self.player:
+                self.run_dmg_dealt += int(dmg)
+                if defender.hp <= 0:
+                    self.run_kills += 1
+            if defender is self.player:
+                self.run_dmg_taken += int(dmg)
+        except Exception:
+            pass
+
     def enemy_turns(self):
         for e in self.enemies:
             if not e.is_alive():
@@ -511,6 +622,8 @@ class Game:
         # Returns True if turn consumed
         if key == ".":
             return True
+        if key == "U":
+            return self.use_potion(manual=True)
         dir_map = {
             "UP": (0, -1),
             "DOWN": (0, 1),
@@ -534,6 +647,45 @@ class Game:
             # If didn't move, maybe attacked
             return True
         return False
+
+    # ---------- Items & Exit ----------
+    def _pickup_items_at(self, x: int, y: int):
+        picked = 0
+        remaining: List[Item] = []
+        for it in self.items:
+            if (it.x, it.y) == (x, y):
+                if it.kind == "potion":
+                    self.inventory["potion"] = self.inventory.get("potion", 0) + 1
+                    picked += 1
+            else:
+                remaining.append(it)
+        if picked > 0:
+            self.items = remaining
+            self.logger.log(f"Picked up Potion x{picked}.")
+
+    def use_potion(self, manual: bool = False) -> bool:
+        cnt = int(self.inventory.get("potion", 0))
+        if cnt <= 0:
+            if manual:
+                self.logger.log("No Potion.")
+            return False
+        if self.player.hp >= self.player.max_hp:
+            if manual:
+                self.logger.log("Already full HP.")
+            return False
+        before = int(self.player.hp)
+        self.player.hp = min(self.player.max_hp, self.player.hp + 8)
+        self.inventory["potion"] = cnt - 1
+        self.run_items_used += 1
+        if manual:
+            self.logger.log(f"You drink a Potion. +{self.player.hp - before} HP")
+        else:
+            self.logger.log("Auto: use Potion")
+        return True
+
+    def _on_victory(self):
+        self.state = "victory"
+        self.logger.log("Victory!")
 
     # ---------- Auto-play helpers ----------
     def _set_auto_fast_params(self):
@@ -619,6 +771,14 @@ class Game:
                 out.append(e)
         return out
 
+    def _visible_items(self, kind: Optional[str] = None) -> List[Item]:
+        out: List[Item] = []
+        for it in self.items:
+            if 0 <= it.x < self.map.w and 0 <= it.y < self.map.h and self.visible[it.y][it.x]:
+                if kind is None or it.kind == kind:
+                    out.append(it)
+        return out
+
     def _nearest(self, src: Tuple[int, int], points: List[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
         if not points:
             return None
@@ -640,6 +800,14 @@ class Game:
                 total_power += max(1, int(e.power))
         if near_count >= 2 and total_power >= self.player.hp // 2:
             return True
+        return False
+
+    def _has_dangerous_adjacent(self) -> bool:
+        px, py = self.player.x, self.player.y
+        for e in self._visible_enemies():
+            if abs(e.x - px) + abs(e.y - py) == 1:
+                if e.power >= 4 or e.name.lower() in ("troll", "shaman"):
+                    return True
         return False
 
     def bot_choose_action(self) -> Tuple[str, Optional[Tuple[int, int]], Optional[List[Tuple[int, int]]], str]:
@@ -671,6 +839,19 @@ class Game:
                     return ("move", (dx, dy), None, "flee (low HP)")
                 return ("wait", None, None, "hold (corner)")
 
+        # 1.5) Exit visible and near (<=6): prioritize if healthy enough and no dangerous adjacent
+        if self.exit_x is not None and self.exit_y is not None:
+            ex, ey = self.exit_x, self.exit_y
+            if 0 <= ex < self.map.w and 0 <= ey < self.map.h and self.visible[ey][ex]:
+                dist_exit = abs(ex - px) + abs(ey - py)
+                if self.player.hp >= max(1, int(self.player.max_hp * 0.3)) and dist_exit <= 6 and not self._has_dangerous_adjacent():
+                    path = self._bfs_path((px, py), [(ex, ey)])
+                    if path and len(path) >= 2:
+                        nx, ny = path[1]
+                        dx, dy = nx - px, ny - py
+                        steps = len(path) - 1
+                        return ("move", (dx, dy), path[1:7], f"path → Exit ({steps} steps)")
+
         # 2) Adjacent enemy: attack
         adj = [(e, abs(e.x - px) + abs(e.y - py)) for e in self._visible_enemies()]
         adj = [(e, d) for (e, d) in adj if d == 1]
@@ -686,6 +867,17 @@ class Game:
             dy = 0 if target.y == py else (1 if target.y > py else -1)
             return ("move", (dx, dy), None, f"attack {target.name}")
 
+        # 2.5) Visible loot (potion): go pick it up
+        vis_items = self._visible_items("potion")
+        if vis_items:
+            goals = [(it.x, it.y) for it in vis_items]
+            path = self._bfs_path((px, py), goals)
+            if path and len(path) >= 2:
+                nx, ny = path[1]
+                dx, dy = nx - px, ny - py
+                steps = len(path) - 1
+                return ("move", (dx, dy), path[1:7], f"path → loot ({steps} steps)")
+
         # 3) Visible enemy: approach via BFS to enemy tile (allow attack on arrival)
         vis = self._visible_enemies()
         if vis:
@@ -700,6 +892,17 @@ class Game:
                 who = next((e for e in vis if (e.x, e.y) == target), None)
                 who_name = who.name if who else "enemy"
                 return ("move", (dx, dy), path[1:7], f"path → {who_name} ({steps} steps)")
+
+        # 3.5) Exit visible but far: consider as a goal after enemies and loot
+        if self.exit_x is not None and self.exit_y is not None:
+            ex, ey = self.exit_x, self.exit_y
+            if 0 <= ex < self.map.w and 0 <= ey < self.map.h and self.visible[ey][ex]:
+                path = self._bfs_path((px, py), [(ex, ey)])
+                if path and len(path) >= 2:
+                    nx, ny = path[1]
+                    dx, dy = nx - px, ny - py
+                    steps = len(path) - 1
+                    return ("move", (dx, dy), path[1:7], f"path → Exit ({steps} steps)")
 
         # 4) Explore: go to nearest frontier
         frontier = self._frontier_targets()
@@ -730,6 +933,8 @@ class Game:
                 self.logger.log("Auto: " + desc)
             elif desc.startswith("explore"):
                 self.logger.log("Auto: " + desc)
+            elif desc.startswith("use potion"):
+                self.logger.log("Auto: use Potion")
             self._auto_target_desc = desc
         # Save path preview
         self._auto_path = path or []
@@ -742,6 +947,11 @@ class Game:
             dx, dy = move
             self.move_entity(self.player, dx, dy)
             consumed = True
+        elif kind == "use_potion":
+            if self.use_potion(manual=False):
+                consumed = True
+            else:
+                consumed = False
         # Enemy turns and turn advancement
         if consumed:
             self.enemy_turns()
@@ -784,6 +994,8 @@ class Game:
                 key = "LEFT"
             elif code == 77:
                 key = "RIGHT"
+            elif code == 67:
+                key = "F9"
         elif ch == "\r":
             key = "ENTER"
         elif ch == "\x1b":
@@ -818,6 +1030,8 @@ class Game:
                     key = "LEFT"
                 elif code == 77:
                     key = "RIGHT"
+                elif code == 67:
+                    key = "F9"
             elif ch == "\r":
                 key = "ENTER"
             elif ch == "\x1b":
@@ -857,7 +1071,7 @@ class Game:
         pane_w = RIGHT_PANE_W
         # Build right pane content (fixed width): status, controls, visible enemies; bottom: folded log
         pane_top_max = max(0, h - HUD_LOG_LINES)
-        if self.state in ("playing", "paused", "game_over"):
+        if self.state in ("playing", "paused", "game_over", "victory"):
             status_line = f"HP {self.player.hp}/{self.player.max_hp}  ATK {self.player.power}  Turn {self.turn}  Seed {self.seed}"
         else:
             seed_str = (str(self.menu_seed_value) if not self.menu_seed_random else "random")
@@ -867,6 +1081,23 @@ class Game:
         pane_top_lines.extend(self._wrap(status_line, pane_w))
         controls_line = "WASD/Arrows: move  .: wait  P: pause  I: inspect  H: help"
         pane_top_lines.extend(self._wrap(controls_line, pane_w))
+        # Goal and inventory
+        try:
+            gl = self._goal_status_line()
+            pane_top_lines.extend(self._wrap(gl, pane_w))
+        except Exception:
+            pass
+        try:
+            il = self._inventory_line()
+            if il:
+                pane_top_lines.extend(self._wrap(il, pane_w))
+        except Exception:
+            pass
+        try:
+            ar_line = f"Auto-Restart: {'ON' if (self.auto_restart_on_death and self.auto_restart_on_victory) else 'OFF'}"
+            pane_top_lines.extend(self._wrap(ar_line, pane_w))
+        except Exception:
+            pass
         # Auto-play status
         auto_speed = max(1, int(self.auto_ticks_per_sec))
         auto_on = "ON" if self.auto_play else "OFF"
@@ -911,6 +1142,10 @@ class Game:
                 else:
                     base_ch = WALL_CHAR
                     base_col = FG_GRAY
+                # Exit overlay on floor
+                if (self.exit_x is not None and self.exit_y is not None and x == self.exit_x and y == self.exit_y and (explored or visible)):
+                    base_ch = ">"
+                    base_col = FG_YELLOW if visible else FG_GRAY
                 ent_here = None
                 if visible:
                     if self.player.is_alive() and self.player.x == x and self.player.y == y:
@@ -920,6 +1155,20 @@ class Game:
                             if e.is_alive() and e.x == x and e.y == y:
                                 ent_here = e
                                 break
+                # Items if visible and no entity on tile
+                if visible and ent_here is None:
+                    it_here = None
+                    for it in self.items:
+                        if it.x == x and it.y == y:
+                            it_here = it
+                            break
+                    if it_here is not None:
+                        item_ch = "!" if it_here.kind == "potion" else ","
+                        if use_color:
+                            row_chars.append(FG_CYAN + item_ch + RESET)
+                        else:
+                            row_chars.append(item_ch)
+                        continue
                 # Inspect cursor overlay
                 if self.inspect_mode and self.inspect_x == x and self.inspect_y == y:
                     cur_ch = "+"
@@ -951,6 +1200,27 @@ class Game:
                 right = right.ljust(pane_w)
             lines.append(left + " " + right)
         return "\n".join(lines)
+
+    def _goal_status_line(self) -> str:
+        if self.exit_x is None or self.exit_y is None:
+            return "Goal: find EXIT"
+        ex, ey = int(self.exit_x), int(self.exit_y)
+        if 0 <= ex < self.map.w and 0 <= ey < self.map.h and (self.visible[ey][ex] or self.map.explored[ey][ex]):
+            px, py = self.player.x, self.player.y
+            dx, dy = ex - px, ey - py
+            dist = abs(dx) + abs(dy)
+            dir_s = _dir_to_compass(dx, dy)
+            return f"Goal: EXIT visible {dir_s} {dist}"
+        return "Goal: find EXIT"
+
+    def _inventory_line(self) -> str:
+        try:
+            pot = int(self.inventory.get("potion", 0))
+        except Exception:
+            pot = 0
+        if pot > 0:
+            return f"Items: ! Potion x{pot}"
+        return ""
 
     def render_frame(self, frame: str):
         if self.ansi:
@@ -986,6 +1256,15 @@ class Game:
             "player": self.player.serialize(),
             "enemies": [e.serialize() for e in self.enemies if e.is_alive()],
             "log": self.logger.serialize(),
+            "exit": {"x": self.exit_x, "y": self.exit_y} if (self.exit_x is not None and self.exit_y is not None) else None,
+            "items": [it.serialize() for it in self.items],
+            "inventory": dict(self.inventory),
+            "stats": {
+                "kills": self.run_kills,
+                "dmg_dealt": self.run_dmg_dealt,
+                "dmg_taken": self.run_dmg_taken,
+                "items_used": self.run_items_used,
+            },
         }
         try:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -1019,6 +1298,19 @@ class Game:
             loaded_enemies.append(Entity.deserialize(ed, cv, cd))
         self.enemies = loaded_enemies
         self.logger.deserialize(data.get("log", []))
+        ex = data.get("exit")
+        if isinstance(ex, dict):
+            self.exit_x = ex.get("x")
+            self.exit_y = ex.get("y")
+        else:
+            self.exit_x, self.exit_y = None, None
+        self.items = [Item.deserialize(it) for it in data.get("items", [])]
+        self.inventory = dict(data.get("inventory", {"potion": 0}))
+        st = data.get("stats", {})
+        self.run_kills = int(st.get("kills", 0))
+        self.run_dmg_dealt = int(st.get("dmg_dealt", 0))
+        self.run_dmg_taken = int(st.get("dmg_taken", 0))
+        self.run_items_used = int(st.get("items_used", 0))
         self.logger.log("Loaded.")
         self.recompute_fov()
         return True

@@ -109,6 +109,126 @@ class NewGameDialog(tk.Toplevel):
         self.destroy()
 
 
+class SeriesDialog(tk.Toplevel):
+    def __init__(self, master: tk.Misc):
+        super().__init__(master)
+        self.title("Auto Series")
+        self.resizable(False, False)
+        self.result: Optional[Tuple[int, bool, int]] = None
+        frm = ttk.Frame(self, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(frm, text="Runs:").grid(row=0, column=0, sticky="w")
+        self.var_runs = tk.IntVar(value=50)
+        ttk.Entry(frm, textvariable=self.var_runs, width=10).grid(row=0, column=1, sticky="w")
+        self.var_fixed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Fixed Seed", variable=self.var_fixed).grid(row=1, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text="Show frames every K ticks (0=hidden):").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.var_show = tk.IntVar(value=0)
+        ttk.Entry(frm, textvariable=self.var_show, width=10).grid(row=3, column=0, sticky="w")
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=2, pady=(10, 0), sticky="e")
+        ttk.Button(btns, text="Start", command=self.on_start).grid(row=0, column=0, padx=5)
+        ttk.Button(btns, text="Cancel", command=self.on_cancel).grid(row=0, column=1)
+        self.bind("<Return>", lambda e: self.on_start())
+        self.bind("<Escape>", lambda e: self.on_cancel())
+        self.grab_set()
+        self.transient(master)
+        self.wait_visibility()
+        self.focus()
+
+    def on_start(self):
+        try:
+            runs = max(1, int(self.var_runs.get()))
+            fixed = bool(self.var_fixed.get())
+            show = max(0, int(self.var_show.get()))
+        except Exception:
+            messagebox.showerror("Invalid", "Please enter valid integers")
+            return
+        self.result = (runs, fixed, show)
+        self.destroy()
+
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class SeriesResultsDialog(tk.Toplevel):
+    def __init__(self, master: tk.Misc, lines: List[str]):
+        super().__init__(master)
+        self.title("Auto Series Results")
+        self.resizable(False, False)
+        frm = ttk.Frame(self, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+        text = "Results:\n" + "\n".join(lines)
+        lbl = tk.Text(frm, width=48, height=min(18, max(8, len(lines) + 4)))
+        lbl.insert("1.0", text)
+        lbl.configure(state="disabled")
+        lbl.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        btns = ttk.Frame(frm)
+        btns.grid(row=1, column=0, columnspan=3, pady=(10, 0), sticky="e")
+        ttk.Button(btns, text="Copy", command=lambda: self._copy(lines)).grid(row=0, column=0, padx=5)
+        ttk.Button(btns, text="Save...", command=lambda: self._save(lines)).grid(row=0, column=1, padx=5)
+        ttk.Button(btns, text="Close", command=self.destroy).grid(row=0, column=2)
+        self.grab_set()
+        self.transient(master)
+        self.wait_visibility()
+        self.focus()
+
+    def _copy(self, lines: List[str]):
+        try:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(lines))
+        except Exception:
+            pass
+
+    def _save(self, lines: List[str]):
+        try:
+            appdata = os.environ.get("APPDATA")
+            base = os.path.join(appdata or os.getcwd(), "TextCrawler2", "reports")
+            os.makedirs(base, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(base, f"series_{ts}.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("Results\n")
+                for s in lines:
+                    f.write(s + "\n")
+            messagebox.showinfo("Saved", f"Saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+
+class RunResultDialog(tk.Toplevel):
+    def __init__(self, master: tk.Misc, rows: List[Tuple[str, str]], on_close=None, on_new=None, on_quit=None):
+        super().__init__(master)
+        self.title("Run Results")
+        self.resizable(False, False)
+        frm = ttk.Frame(self, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+        for i, (k, v) in enumerate(rows):
+            ttk.Label(frm, text=f"{k}:").grid(row=i, column=0, sticky="w", padx=(0, 8))
+            ttk.Label(frm, text=v).grid(row=i, column=1, sticky="w")
+        btns = ttk.Frame(frm)
+        btns.grid(row=len(rows), column=0, columnspan=2, pady=(10, 0), sticky="e")
+        ttk.Button(btns, text="New Run (R)", command=lambda: self._do(on_new)).grid(row=0, column=0, padx=5)
+        ttk.Button(btns, text="Quit (Q)", command=lambda: self._do(on_quit)).grid(row=0, column=1, padx=5)
+        ttk.Button(btns, text="Close", command=lambda: self._do(on_close)).grid(row=0, column=2)
+        self.bind("<Escape>", lambda e: self._do(on_close))
+        self.bind("<KeyPress-r>", lambda e: self._do(on_new))
+        self.bind("<KeyPress-q>", lambda e: self._do(on_quit))
+        self.grab_set()
+        self.transient(master)
+        self.wait_visibility()
+        self.focus()
+
+    def _do(self, fn):
+        try:
+            if fn:
+                fn()
+        finally:
+            try:
+                self.destroy()
+            except Exception:
+                pass
 class GuiApp:
     def __init__(self, game: Game):
         enable_dpi_awareness()
@@ -141,6 +261,23 @@ class GuiApp:
         # Auto-play scheduler state
         self._auto_after_id: Optional[str] = None
         self._auto_counter: int = 0
+        # Series/batch state
+        self._series_active: bool = False
+        self._series_total: int = 0
+        self._series_done: int = 0
+        self._series_wins: int = 0
+        self._series_losses: int = 0
+        self._series_sum_turns: int = 0
+        self._series_sum_kills: int = 0
+        self._series_sum_dmg_taken: int = 0
+        self._series_sum_dmg_dealt: int = 0
+        self._series_sum_items_used: int = 0
+        self._series_fixed_seed: bool = False
+        self._series_base_seed: int = 1337
+        self._series_show_every: int = 0
+        self._series_report_lines: Optional[List[str]] = None
+        # Modal/dialog guard
+        self._modal_open: bool = False
 
         # Input bindings
         self.root.bind("<KeyPress>", self.on_key)
@@ -174,7 +311,13 @@ class GuiApp:
         file_menu.add_cascade(label="Speed", menu=speed_menu)
         self.var_fast = tk.BooleanVar(value=self.game.auto_fast)
         file_menu.add_checkbutton(label="Fast Mode (skip draws)", variable=self.var_fast, command=self.menu_toggle_fast)
+        # Auto-Restart flags
+        self.var_ar_death = tk.BooleanVar(value=self.game.auto_restart_on_death)
+        self.var_ar_victory = tk.BooleanVar(value=self.game.auto_restart_on_victory)
+        file_menu.add_checkbutton(label="Auto-Restart on Death", variable=self.var_ar_death, command=self.menu_toggle_ar_death)
+        file_menu.add_checkbutton(label="Auto-Restart on Victory", variable=self.var_ar_victory, command=self.menu_toggle_ar_victory)
         file_menu.add_separator()
+        file_menu.add_command(label="Auto Series...", command=self.menu_series)
         file_menu.add_command(label="Start Demo", command=self.menu_start_demo)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_close)
@@ -253,6 +396,16 @@ class GuiApp:
             self.redraw()
             return
 
+        # F9 toggles auto-restart both
+        if key == "F9":
+            v = not (g.auto_restart_on_death and g.auto_restart_on_victory)
+            g.auto_restart_on_death = v
+            g.auto_restart_on_victory = v
+            self._toast(f"Auto-Restart: {'ON' if v else 'OFF'}")
+            self._ensure_auto()
+            self.redraw()
+            return
+
         # In paused mode: Save/Load/Restart
         if g.state == "paused":
             if key == "S":
@@ -312,6 +465,17 @@ class GuiApp:
                 self._toast("Auto: OFF")
             self._ensure_auto()
             self.redraw()
+            return
+        if key == "U":
+            used = g.use_potion(manual=True)
+            if used and g.state == "playing":
+                g.enemy_turns()
+                g.turn += 1
+                g.recompute_fov()
+                self._ingest_damage_events()
+                self._ensure_tick()
+                self._ensure_auto()
+                self.redraw()
             return
         if key in ("[", "]"):
             speeds = [4, 8, 16, 32, 64]
@@ -465,6 +629,16 @@ class GuiApp:
                     fill = "#b0b0b0" if visible else "#404040"  # walls
                 self.canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline="")
 
+        # Draw Exit portal tile (glow)
+        ex, ey = getattr(g, 'exit_x', None), getattr(g, 'exit_y', None)
+        if isinstance(ex, int) and isinstance(ey, int):
+            if 0 <= ex < map_cols and 0 <= ey < map_rows and g.map.explored[ey][ex]:
+                x0 = ox + ex * tile
+                y0 = oy + ey * tile
+                pad = max(2, tile // 8)
+                self.canvas.create_oval(x0 + pad//2, y0 + pad//2, x0 + tile - pad//2, y0 + tile - pad//2, outline="#ffd700", width=2)
+                self.canvas.create_oval(x0 + pad, y0 + pad, x0 + tile - pad, y0 + tile - pad, outline="#80c0ff", width=2)
+
         # Draw corpses silhouettes (explored and visible or explored only?)
         for (cx, cy, kind) in getattr(g, 'corpses', []):
             if 0 <= cx < map_cols and 0 <= cy < map_rows and g.map.explored[cy][cx]:
@@ -472,6 +646,18 @@ class GuiApp:
                 y0 = oy + cy * tile
                 pad = max(2, tile // 8)
                 self.canvas.create_oval(x0 + pad, y0 + pad, x0 + tile - pad, y0 + tile - pad, fill="#606060", outline="")
+
+        # Draw items (visible)
+        try:
+            for it in list(getattr(g, 'items', []) or []):
+                if 0 <= it.x < map_cols and 0 <= it.y < map_rows and g.visible[it.y][it.x]:
+                    x0 = ox + it.x * tile
+                    y0 = oy + it.y * tile
+                    # Small bottle icon
+                    self.canvas.create_rectangle(x0 + tile*0.35, y0 + tile*0.25, x0 + tile*0.65, y0 + tile*0.65, fill="#40c0ff", outline="#a0e0ff")
+                    self.canvas.create_rectangle(x0 + tile*0.45, y0 + tile*0.15, x0 + tile*0.55, y0 + tile*0.25, fill="#a0e0ff", outline="")
+        except Exception:
+            pass
 
         # Draw entities (only if visible)
         for y in range(map_rows):
@@ -535,7 +721,7 @@ class GuiApp:
         pane_x0 = ox + map_cols * tile + self.gap_px
         pane_y0 = oy
         # Status
-        if g.state in ("playing", "paused", "game_over"):
+        if g.state in ("playing", "paused", "game_over", "victory"):
             status_line = f"HP {g.player.hp}/{g.player.max_hp}  ATK {g.player.power}  Turn {g.turn}  Seed {g.seed}"
         else:
             seed_str = (str(g.menu_seed_value) if not g.menu_seed_random else "random")
@@ -545,7 +731,21 @@ class GuiApp:
         auto_on = "ON" if g.auto_play else "OFF"
         fast_suffix = f"  Fast: {'ON' if g.auto_fast else 'OFF'}"
         auto_line = f"AUTO: {auto_on}  Speed: {auto_speed} tps{fast_suffix}  (A toggle, [ ] speed, }} fast)"
+        goal_line = ""
+        inv_line = ""
+        try:
+            goal_line = g._goal_status_line()
+            inv_line = g._inventory_line()
+        except Exception:
+            goal_line = goal_line or ""
+            inv_line = inv_line or ""
+        ar_line = f"Auto-Restart: {'ON' if (g.auto_restart_on_death and g.auto_restart_on_victory) else 'OFF'}"
         pane_lines: List[str] = [status_line, controls_line, auto_line]
+        if goal_line:
+            pane_lines.append(goal_line)
+        if inv_line:
+            pane_lines.append(inv_line)
+        pane_lines.append(ar_line)
         if g.state in ("playing", "paused", "game_over"):
             if g.inspect_mode:
                 pane_lines.extend(["[Inspect]"] + _inspect_info_lines(g))
@@ -596,6 +796,31 @@ class GuiApp:
 
         self.canvas.update_idletasks()
 
+        # Show victory/defeat modal if ended and no auto-restart/series
+        if not self._series_active and g.state in ("victory", "game_over") and not self._modal_open:
+            should = not ((g.state == "victory" and g.auto_restart_on_victory) or (g.state == "game_over" and g.auto_restart_on_death))
+            if should:
+                self._modal_open = True
+                summary = [
+                    ("Result", "Victory!" if g.state == "victory" else "Defeat"),
+                    ("Turns", str(g.turn)),
+                    ("Kills", str(g.run_kills)),
+                    ("Items used", str(g.run_items_used)),
+                    ("Dmg dealt", str(g.run_dmg_dealt)),
+                    ("Dmg taken", str(g.run_dmg_taken)),
+                    ("Seed", str(g.seed)),
+                ]
+                RunResultDialog(self.root, summary, on_close=self._on_modal_close, on_new=self._on_modal_new, on_quit=self.on_close)
+
+    def _on_modal_close(self):
+        self._modal_open = False
+        self.redraw()
+
+    def _on_modal_new(self):
+        self._modal_open = False
+        self.game.new_game(is_restart=True)
+        self.redraw()
+
     def _draw_paused_overlay(self, ox: int, oy: int, w: int, h: int):
         # Dim background
         self.canvas.create_rectangle(ox, oy, ox + w, oy + h, fill="#000000", outline="", stipple="gray50")
@@ -621,7 +846,7 @@ class GuiApp:
             "Unknown: space",
             "Player: @ bright white/yellow",
             "Enemies: g Goblin green, a Archer cyan, p Priest magenta, T Troll green, s Shaman yellow",
-            "> exit (if present)",
+            "> Exit, ! Potion",
             "",
             "Controls:",
             "WASD/Arrows move; . wait; P pause; I inspect; H help; R restart; Q quit",
@@ -720,6 +945,18 @@ class GuiApp:
         self._ensure_auto()
         self.redraw()
 
+    def menu_toggle_ar_death(self):
+        self.game.auto_restart_on_death = bool(self.var_ar_death.get())
+        self._toast("Auto-Restart on Death: " + ("ON" if self.game.auto_restart_on_death else "OFF"))
+        self._ensure_auto()
+        self.redraw()
+
+    def menu_toggle_ar_victory(self):
+        self.game.auto_restart_on_victory = bool(self.var_ar_victory.get())
+        self._toast("Auto-Restart on Victory: " + ("ON" if self.game.auto_restart_on_victory else "OFF"))
+        self._ensure_auto()
+        self.redraw()
+
     def menu_start_demo(self):
         # New random game + enable auto at 16 tps
         self.game.menu_seed_random = True
@@ -739,6 +976,85 @@ class GuiApp:
         self._ensure_auto()
         self.redraw()
 
+    def menu_series(self):
+        dlg = SeriesDialog(self.root)
+        self.root.wait_window(dlg)
+        if not dlg.result:
+            return
+        runs, fixed, show_every = dlg.result
+        self.start_series(runs, fixed, show_every)
+
+    def start_series(self, runs: int, fixed_seed: bool, show_every: int):
+        # Initialize counters
+        self._series_active = True
+        self._series_total = max(1, int(runs))
+        self._series_done = 0
+        self._series_wins = 0
+        self._series_losses = 0
+        self._series_sum_turns = 0
+        self._series_sum_kills = 0
+        self._series_sum_dmg_taken = 0
+        self._series_sum_dmg_dealt = 0
+        self._series_sum_items_used = 0
+        self._series_fixed_seed = bool(fixed_seed)
+        self._series_show_every = max(0, int(show_every))
+        self._series_base_seed = int(self.game.menu_seed_value if not self.game.menu_seed_random else int(time.time() * 1000))
+        # Configure game
+        self.game.auto_play = True
+        try:
+            self.var_auto.set(True)
+        except Exception:
+            pass
+        self.game.auto_fast = True
+        try:
+            self.var_fast.set(True)
+        except Exception:
+            pass
+        if self._series_show_every <= 0:
+            self.game.auto_render_every_n_ticks = 10**9
+        else:
+            self.game.auto_render_every_n_ticks = max(1, int(self._series_show_every))
+        # Start first run
+        self._series_next_run()
+        self._ensure_auto()
+
+    def _series_next_run(self):
+        if self._series_done >= self._series_total:
+            self._series_finish()
+            return
+        # Seed setup
+        if self._series_fixed_seed:
+            self.game.menu_seed_random = False
+            self.game.menu_seed_value = self._series_base_seed
+        else:
+            self.game.menu_seed_random = True
+            self.game.menu_seed_value = -1
+        self.game.new_game(is_restart=False)
+        self.game._series_mode = True
+        self._series_done += 1
+        self._toast(f"Series: run {self._series_done}/{self._series_total}")
+        self.redraw()
+
+    def _series_finish(self):
+        self.game._series_mode = False
+        self._series_active = False
+        N = max(1, int(self._series_total))
+        winrate = (self._series_wins / N) * 100.0
+        lines = [
+            f"Runs: {N}",
+            f"Wins: {self._series_wins}",
+            f"Losses: {self._series_losses}",
+            f"Winrate: {winrate:.1f}%",
+            f"Avg Turns: {self._series_sum_turns / N:.1f}",
+            f"Avg Kills: {self._series_sum_kills / N:.1f}",
+            f"Avg Damage Taken: {self._series_sum_dmg_taken / N:.1f}",
+            f"Avg Damage Dealt: {self._series_sum_dmg_dealt / N:.1f}",
+            f"Avg Items Used: {self._series_sum_items_used / N:.2f}",
+        ]
+        self._series_report_lines = lines
+        SeriesResultsDialog(self.root, lines)
+        self.redraw()
+
     # ---------- Helpers ----------
     def _normalize_key(self, event: tk.Event) -> Optional[str]:
         keysym = event.keysym or ""
@@ -747,6 +1063,8 @@ class GuiApp:
         # Arrows
         if ks in ("Up", "Down", "Left", "Right"):
             return ks.upper()
+        if ks == "F9":
+            return "F9"
         # Escape/Enter
         if ks == "Escape":
             return "ESC"
@@ -871,8 +1189,29 @@ class GuiApp:
         if g.state == "playing":
             g.auto_tick()
             self._auto_counter += 1
-        # Redraw per fast mode
-        if (not g.auto_fast) or (self._auto_counter % max(1, g.auto_render_every_n_ticks) == 0):
+        else:
+            # End of run handling for series
+            if self._series_active and g.state in ("victory", "game_over"):
+                if g.state == "victory":
+                    self._series_wins += 1
+                else:
+                    self._series_losses += 1
+                self._series_sum_turns += int(g.turn)
+                self._series_sum_kills += int(g.run_kills)
+                self._series_sum_dmg_taken += int(g.run_dmg_taken)
+                self._series_sum_dmg_dealt += int(g.run_dmg_dealt)
+                self._series_sum_items_used += int(g.run_items_used)
+                # Next run after short delay
+                self.root.after(max(1, int(g.auto_restart_delay_ms)), self._series_next_run)
+            elif (g.state in ("victory", "game_over")):
+                should = (g.state == "victory" and g.auto_restart_on_victory) or (g.state == "game_over" and g.auto_restart_on_death)
+                if should:
+                    self.root.after(max(1, int(g.auto_restart_delay_ms)), lambda: (g.new_game(is_restart=True), self.redraw()))
+        # Redraw per fast mode (skip if hidden during series)
+        should_draw = (not g.auto_fast) or (self._auto_counter % max(1, g.auto_render_every_n_ticks) == 0)
+        if self._series_active and self._series_show_every == 0:
+            should_draw = False
+        if should_draw:
             self.redraw()
         self._ensure_auto()
 
