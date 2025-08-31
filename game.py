@@ -491,6 +491,28 @@ class Game:
         # Auto diagnostics / anti-stuck
         self._auto_wait_streak: int = 0
         self._auto_reason: Optional[str] = None
+        # Anti-oscillation state and config
+        self._auto_visit_heat: List[List[int]] = [[0 for _ in range(self.map.w)] for _ in range(self.map.h)]
+        self._auto_last_dir: Tuple[int, int] = (0, 0)
+        self._auto_prev_pos: Tuple[int, int] = (0, 0)
+        self._auto_prev_prev_pos: Tuple[int, int] = (0, 0)
+        self._auto_oscillate_count: int = 0
+        self._auto_last_back_penalty: int = 0
+        self._auto_last_heat: int = 0
+        self._auto_commit_left: int = 0
+        self.cfg_backtrack_penalty_base: int = 3
+        self.cfg_backtrack_penalty_step: int = 2
+        self.cfg_backtrack_penalty_max: int = 10
+        self.cfg_visit_weight: float = 0.8
+        self.cfg_visit_cap: int = 8
+        self.cfg_commit_steps: int = 2
+        self.cfg_smoothing_max_skip: int = 1
+        self.cfg_tie_break_tiny: float = 0.01
+        self._auto_explored_count_prev: int = 0
+        try:
+            self._load_autoplay_config()
+        except Exception:
+            pass
         # Optional behaviors
         self.auto_restart_on_death: bool = True
         self.auto_restart_on_victory: bool = True
@@ -594,6 +616,11 @@ class Game:
             self.logger.log(f"New game. Seed={self.seed}")
         self.state = "playing"
         self.recompute_fov()
+        # Reset anti-oscillation/heat state for new map
+        try:
+            self._reset_auto_internal_state()
+        except Exception:
+            pass
 
     def _place_exit(self):
         # Place Exit in the farthest room if rooms-gen; otherwise farthest floor tile
@@ -838,6 +865,10 @@ class Game:
                         d.open = True
                 ent.x, ent.y = nx, ny
                 if ent is self.player:
+                    try:
+                        self._inc_visit_heat(nx, ny)
+                    except Exception:
+                        pass
                     # Pickup items and check exit
                     self._pickup_items_at(nx, ny)
                     if self.exit_x is not None and self.exit_y is not None and (nx, ny) == (self.exit_x, self.exit_y):
@@ -1040,12 +1071,35 @@ class Game:
                     if name_lc in ("shaman", "priest"):
                         should_wander = should_wander and (nl % 2 == 0)
                     if (not did) and should_wander:
-                        dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                        self.rng.shuffle(dirs)
-                        for dx, dy in dirs:
-                            if not self.is_blocked(ex + dx, ey + dy):
-                                self.move_entity(e, dx, dy, attack_on_block=False)
-                                break
+                        # 60% bias toward last seen player position; else random
+                        lsp = getattr(e, "_last_seen_player", None)
+                        moved = False
+                        if lsp is not None and self.rng.random() < 0.6:
+                            tx, ty = lsp
+                            sdx = 0 if ex == tx else (1 if tx > ex else -1)
+                            sdy = 0 if ey == ty else (1 if ty > ey else -1)
+                            # try axis with larger distance first
+                            if abs(tx - ex) >= abs(ty - ey):
+                                if not self.is_blocked(ex + sdx, ey):
+                                    self.move_entity(e, sdx, 0, attack_on_block=False)
+                                    moved = True
+                                elif not self.is_blocked(ex, ey + sdy):
+                                    self.move_entity(e, 0, sdy, attack_on_block=False)
+                                    moved = True
+                            else:
+                                if not self.is_blocked(ex, ey + sdy):
+                                    self.move_entity(e, 0, sdy, attack_on_block=False)
+                                    moved = True
+                                elif not self.is_blocked(ex + sdx, ey):
+                                    self.move_entity(e, sdx, 0, attack_on_block=False)
+                                    moved = True
+                        if not moved:
+                            dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                            self.rng.shuffle(dirs)
+                            for dx, dy in dirs:
+                                if not self.is_blocked(ex + dx, ey + dy):
+                                    self.move_entity(e, dx, dy, attack_on_block=False)
+                                    break
 
             # End-of-turn effects for this enemy
             if name_l == "troll" and e.is_alive():
@@ -1147,6 +1201,45 @@ class Game:
         else:
             self.auto_render_every_n_ticks = 1
 
+    def _load_autoplay_config(self):
+        cfg = None
+        try:
+            if ('_pl' in globals()) and (_pl is not None):
+                cfg = _pl.get_config()
+        except Exception:
+            cfg = None
+        a = (cfg or {}).get("autoplay") or {}
+        try:
+            self.cfg_backtrack_penalty_base = int(a.get("backtrack_penalty_base", self.cfg_backtrack_penalty_base))
+            self.cfg_backtrack_penalty_step = int(a.get("backtrack_penalty_step", self.cfg_backtrack_penalty_step))
+            self.cfg_backtrack_penalty_max = int(a.get("backtrack_penalty_max", self.cfg_backtrack_penalty_max))
+            self.cfg_visit_weight = float(a.get("visit_weight", self.cfg_visit_weight))
+            self.cfg_visit_cap = int(a.get("visit_cap", self.cfg_visit_cap))
+            self.cfg_commit_steps = int(a.get("commit_steps", self.cfg_commit_steps))
+            self.cfg_smoothing_max_skip = int(a.get("smoothing_max_skip", self.cfg_smoothing_max_skip))
+            self.cfg_tie_break_tiny = float(a.get("tie_break_tiny", self.cfg_tie_break_tiny))
+        except Exception:
+            pass
+
+    def _reset_auto_internal_state(self):
+        self._auto_visit_heat = [[0 for _ in range(self.map.w)] for _ in range(self.map.h)]
+        self._auto_last_dir = (0, 0)
+        self._auto_prev_pos = (self.player.x, self.player.y)
+        self._auto_prev_prev_pos = (self.player.x, self.player.y)
+        self._auto_oscillate_count = 0
+        self._auto_last_back_penalty = 0
+        self._auto_last_heat = 0
+        self._auto_commit_left = 0
+        self._auto_explored_count_prev = sum(1 for y in range(self.map.h) for x in range(self.map.w) if self.map.explored[y][x])
+
+    def _inc_visit_heat(self, x: int, y: int) -> None:
+        try:
+            cur = int(self._auto_visit_heat[y][x])
+            cap = max(0, int(self.cfg_visit_cap))
+            self._auto_visit_heat[y][x] = min(cap, cur + 1)
+        except Exception:
+            pass
+
     def _neighbors4(self, x: int, y: int) -> List[Tuple[int, int]]:
         cand = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
         out: List[Tuple[int, int]] = []
@@ -1225,8 +1318,97 @@ class Game:
                     heapq.heappush(pq, (new_cost, nxt))
         return None
 
+    def _astar_path(self, start: Tuple[int, int], goals: List[Tuple[int, int]]) -> Optional[List[Tuple[int, int]]]:
+        """A* with soft costs, visit heat, backtrack hysteresis, and tie-breaker.
+        Allows stepping into enemy tiles (soft). Closed doors are passable if not locked or if we have a key.
+        Returns full path from start to goal inclusive; None if unreachable.
+        """
+        if not goals:
+            return None
+        import heapq
+
+        sx, sy = start
+        goals_sorted = sorted(goals, key=lambda p: abs(p[0]-sx) + abs(p[1]-sy))
+        hint = goals_sorted[0]
+        hx, hy = hint
+        hvx, hvy = (hx - sx), (hy - sy)
+        goal_set = set(goals)
+
+        def h_est(x: int, y: int) -> int:
+            return min(abs(x - gx) + abs(y - gy) for gx, gy in goals)
+
+        def enemy_soft(x: int, y: int) -> int:
+            for e in self.enemies:
+                if e.is_alive() and (e.x, e.y) == (x, y):
+                    return 2
+            return 0
+
+        def door_soft(cx: int, cy: int, nx: int, ny: int) -> int:
+            d = self.map.door_at(nx, ny)
+            if not d:
+                return 0
+            if d.locked and int(self.inventory.get("key", 0)) <= 0:
+                return 10**6
+            if not d.open:
+                return 1
+            return 0
+
+        def back_pen(cx: int, cy: int, nx: int, ny: int) -> int:
+            dx, dy = nx - cx, ny - cy
+            ldx, ldy = self._auto_last_dir
+            if dx == -ldx and dy == -ldy:
+                pen = int(self.cfg_backtrack_penalty_base) + int(self.cfg_backtrack_penalty_step) * int(self._auto_oscillate_count)
+                return max(0, min(int(self.cfg_backtrack_penalty_max), pen))
+            return 0
+
+        def heat_cost(nx: int, ny: int) -> float:
+            try:
+                return float(self._auto_visit_heat[ny][nx]) * float(self.cfg_visit_weight)
+            except Exception:
+                return 0.0
+
+        def tie_bias(nx: int, ny: int) -> float:
+            v2x, v2y = (nx - sx), (ny - sy)
+            cross = abs(hvx * v2y - hvy * v2x)
+            return float(self.cfg_tie_break_tiny) * float(cross)
+
+        openq: List[Tuple[float, Tuple[int, int]]] = []
+        heapq.heappush(openq, (0.0, start))
+        came: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
+        g: Dict[Tuple[int, int], float] = {start: 0.0}
+
+        while openq:
+            fcur, cur = heapq.heappop(openq)
+            if cur in goal_set:
+                path: List[Tuple[int, int]] = []
+                at = cur
+                while at is not None:
+                    path.append(at)
+                    at = came[at]
+                path.reverse()
+                return path
+            cx, cy = cur
+            for nx, ny in ((cx+1, cy), (cx-1, cy), (cx, cy+1), (cx, cy-1)):
+                if not self.map.in_bounds(nx, ny):
+                    continue
+                if not self.map.is_walkable(nx, ny):
+                    continue
+                # door semantics
+                ds = door_soft(cx, cy, nx, ny)
+                if ds >= 10**6:
+                    continue
+                step = 1.0 + float(ds) + float(enemy_soft(nx, ny)) + heat_cost(nx, ny) + float(back_pen(cx, cy, nx, ny))
+                tentative = g[cur] + step
+                nxt = (nx, ny)
+                if tentative + 1e-9 < g.get(nxt, float('inf')):
+                    g[nxt] = tentative
+                    came[nxt] = cur
+                    f = tentative + float(h_est(nx, ny)) + tie_bias(nx, ny)
+                    heapq.heappush(openq, (f, nxt))
+        return None
+
     def _frontier_targets(self) -> List[Tuple[int, int]]:
-        """Tiles we know and that border unexplored space to encourage exploration without map cheating."""
+        """Tiles we know and that border unknown space (including behind closed doors)."""
         t: List[Tuple[int, int]] = []
         for y in range(self.map.h):
             for x in range(self.map.w):
@@ -1234,11 +1416,30 @@ class Game:
                     continue
                 if not (self.map.explored[y][x] or self.visible[y][x]):
                     continue
-                # frontier if at least one neighbor is not explored
-                for nx, ny in self._neighbors4(x, y):
-                    if not self.map.explored[ny][nx]:
+                added = False
+                # check raw 4-neighbors for unknown
+                for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                    nx, ny = x + dx, y + dy
+                    if not self.map.in_bounds(nx, ny):
+                        continue
+                    if not (self.map.explored[ny][nx] or self.visible[ny][nx]):
                         t.append((x, y))
+                        added = True
                         break
+                if added:
+                    continue
+                # behind closed doors
+                for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                    nx, ny = x + dx, y + dy
+                    if not self.map.in_bounds(nx, ny):
+                        continue
+                    d = self.map.door_at(nx, ny)
+                    if d and not d.open:
+                        bx, by = nx + dx, ny + dy
+                        if self.map.in_bounds(bx, by):
+                            if not self.map.explored[by][bx]:
+                                t.append((x, y))
+                                break
         return t
 
     def _visible_enemies(self) -> List[Entity]:
@@ -1302,6 +1503,26 @@ class Game:
         if self.state != "playing" or not self.player.is_alive():
             return ("wait", None, None, "idle")
         px, py = self.player.x, self.player.y
+        # Commit buffer: stick to first steps of last path unless emergency
+        def _emergency_break_commit() -> bool:
+            if self._estimate_risk_should_flee():
+                return True
+            # Any archer aiming in LOS
+            for e in self._visible_enemies():
+                if (e.name or '').lower() == 'archer' and e.effects.get('Aim'):
+                    if (e.x == px or e.y == py) and self.has_los(e.x, e.y, px, py, radius=12) and max(abs(e.x-px), abs(e.y-py)) >= 2:
+                        return True
+            return False
+        if self._auto_commit_left > 0 and self._auto_path and not _emergency_break_commit():
+            try:
+                if (px, py) in self._auto_path:
+                    i = self._auto_path.index((px, py))
+                    if i + 1 < len(self._auto_path):
+                        nx, ny = self._auto_path[i + 1]
+                        dx, dy = nx - px, ny - py
+                        return ("move", (dx, dy), self._auto_path[i+1:i+7], f"auto: commit path ({self._auto_commit_left})")
+            except Exception:
+                pass
 
         # Archer LOS avoidance helpers
         def _archers_in_line_aiming() -> List[Entity]:
@@ -1381,11 +1602,14 @@ class Game:
             if 0 <= ex < self.map.w and 0 <= ey < self.map.h and self.visible[ey][ex]:
                 dist_exit = abs(ex - px) + abs(ey - py)
                 if self.player.hp >= max(1, int(self.player.max_hp * 0.3)) and dist_exit <= 6 and not self._has_dangerous_adjacent():
-                    path = self._bfs_path((px, py), [(ex, ey)])
+                    path = self._astar_path((px, py), [(ex, ey)])
                     if path and len(path) >= 2:
                         nx, ny = path[1]
                         dx, dy = nx - px, ny - py
                         steps = len(path) - 1
+                        self._auto_commit_left = max(0, int(self.cfg_commit_steps))
+                        self._auto_path = list(path)
+                        self._auto_reason = "commit"
                         return ("move", (dx, dy), path[1:7], f"path → Exit ({steps} steps)")
 
         # 2) Adjacent enemy: attack
@@ -1407,11 +1631,14 @@ class Game:
         vis_items = self._visible_items("potion")
         if vis_items:
             goals = [(it.x, it.y) for it in vis_items]
-            path = self._bfs_path((px, py), goals)
+            path = self._astar_path((px, py), goals)
             if path and len(path) >= 2:
                 nx, ny = path[1]
                 dx, dy = nx - px, ny - py
                 steps = len(path) - 1
+                self._auto_commit_left = max(0, int(self.cfg_commit_steps))
+                self._auto_path = list(path)
+                self._auto_reason = "commit"
                 return ("move", (dx, dy), path[1:7], f"path → loot ({steps} steps)")
 
         # 3) Visible enemy: approach via BFS to enemy tile (allow attack on arrival)
@@ -1424,20 +1651,26 @@ class Game:
             _sorted = sorted([e for e in vis], key=lambda e: (_pri(e.name), abs(e.x - px) + abs(e.y - py)))
             if _sorted:
                 _t = _sorted[0]
-                _p = self._bfs_path((px, py), [(_t.x, _t.y)])
+                _p = self._astar_path((px, py), [(_t.x, _t.y)])
                 if _p and len(_p) >= 2:
                     nx, ny = _p[1]
                     dx, dy = nx - px, ny - py
                     steps = len(_p) - 1
+                    self._auto_commit_left = max(0, int(self.cfg_commit_steps))
+                    self._auto_path = list(_p)
+                    self._auto_reason = "commit"
                     return ("move", (dx, dy), _p[1:7], f"path → {_t.name} ({steps} steps)")
             # nearest by BFS distance approx (use Manhattan heuristic for pick)
             goals = [(e.x, e.y) for e in vis]
-            path = self._bfs_path((px, py), goals)
+            path = self._astar_path((px, py), goals)
             if path and len(path) >= 2:
                 nx, ny = path[1]
                 dx, dy = nx - px, ny - py
                 target = self._nearest((px, py), goals)
                 steps = len(path) - 1
+                self._auto_commit_left = max(0, int(self.cfg_commit_steps))
+                self._auto_path = list(path)
+                self._auto_reason = "commit"
                 who = next((e for e in vis if (e.x, e.y) == target), None)
                 who_name = who.name if who else "enemy"
                 return ("move", (dx, dy), path[1:7], f"path → {who_name} ({steps} steps)")
@@ -1446,21 +1679,27 @@ class Game:
         if self.exit_x is not None and self.exit_y is not None:
             ex, ey = self.exit_x, self.exit_y
             if 0 <= ex < self.map.w and 0 <= ey < self.map.h and self.visible[ey][ex]:
-                path = self._bfs_path((px, py), [(ex, ey)])
+                path = self._astar_path((px, py), [(ex, ey)])
                 if path and len(path) >= 2:
                     nx, ny = path[1]
                     dx, dy = nx - px, ny - py
                     steps = len(path) - 1
+                    self._auto_commit_left = max(0, int(self.cfg_commit_steps))
+                    self._auto_path = list(path)
+                    self._auto_reason = "commit"
                     return ("move", (dx, dy), path[1:7], f"path → Exit ({steps} steps)")
 
         # 4) Explore: go to nearest frontier
         frontier = self._frontier_targets()
         if frontier:
-            path = self._bfs_path((px, py), frontier)
+            path = self._astar_path((px, py), frontier)
             if path and len(path) >= 2:
                 nx, ny = path[1]
                 dx, dy = nx - px, ny - py
                 steps = len(path) - 1
+                self._auto_commit_left = max(0, int(self.cfg_commit_steps))
+                self._auto_path = list(path)
+                self._auto_reason = "commit"
                 return ("move", (dx, dy), path[1:7], f"explore ({steps} steps)")
         # If frontier is empty or unreachable, allow a cautious step into nearby darkness
         for nx, ny in self._neighbors4(px, py):
@@ -1526,6 +1765,7 @@ class Game:
                 # Force replan and perform a cautious step
                 self._auto_target_desc = None
                 self._auto_path = []
+                self._auto_commit_left = 0
                 self._auto_reason = f"stuck {self._auto_wait_streak}"
                 self.logger.log("Auto: replan (no_progress)")
                 if self._auto_safe_fallback_step():
@@ -1546,6 +1786,49 @@ class Game:
                 self._digest = None
             # progress tracking
             new = (self.player.x, self.player.y)
+            # Update visit heat and hysteresis on successful move
+            if new != old:
+                try:
+                    self._inc_visit_heat(new[0], new[1])
+                except Exception:
+                    pass
+                if new == self._auto_prev_prev_pos:
+                    self._auto_oscillate_count = min(self._auto_oscillate_count + 1, 50)
+                    self._auto_reason = "anti-oscillation"
+                    try:
+                        self.logger.log("Auto: anti-oscillation (backtrack+heat)")
+                    except Exception:
+                        pass
+                else:
+                    self._auto_oscillate_count = 0
+                # track last heat/penalty diagnostics
+                try:
+                    self._auto_last_heat = int(self._auto_visit_heat[new[1]][new[0]])
+                except Exception:
+                    self._auto_last_heat = 0
+                # back penalty if reversed direction
+                try:
+                    ldx, ldy = self._auto_last_dir
+                    ndx, ndy = (new[0] - old[0], new[1] - old[1])
+                    back = (ndx == -ldx and ndy == -ldy)
+                    if back:
+                        pen = int(self.cfg_backtrack_penalty_base) + int(self.cfg_backtrack_penalty_step) * int(self._auto_oscillate_count)
+                        self._auto_last_back_penalty = max(0, min(int(self.cfg_backtrack_penalty_max), pen))
+                    else:
+                        self._auto_last_back_penalty = 0
+                except Exception:
+                    self._auto_last_back_penalty = 0
+                self._auto_prev_prev_pos = self._auto_prev_pos
+                self._auto_prev_pos = new
+                self._auto_last_dir = (new[0] - old[0], new[1] - old[1])
+                # Consume a committed step if matched
+                if self._auto_commit_left > 0 and self._auto_path and (old in self._auto_path):
+                    try:
+                        i = self._auto_path.index(old)
+                        if i + 1 < len(self._auto_path) and self._auto_path[i + 1] == new:
+                            self._auto_commit_left = max(0, self._auto_commit_left - 1)
+                    except Exception:
+                        pass
             plan_unchanged = (desc == prev_desc) and (tuple(self._auto_path or []) == prev_path)
             if new == old and plan_unchanged:
                 self._auto_no_progress_ticks += 1
@@ -1557,7 +1840,15 @@ class Game:
                 self._auto_path = []
                 self._auto_no_progress_ticks = 0
                 self.logger.log("Auto: replan (no progress)")
+        # FOV update and new-info reset for oscillation
         self.recompute_fov()
+        try:
+            cur_exp = sum(1 for y in range(self.map.h) for x in range(self.map.w) if self.map.explored[y][x])
+            if cur_exp > int(self._auto_explored_count_prev):
+                self._auto_oscillate_count = 0
+            self._auto_explored_count_prev = cur_exp
+        except Exception:
+            pass
         return consumed
 
     def _auto_safe_fallback_step(self) -> bool:
@@ -2013,7 +2304,12 @@ class Game:
                 target = "Avoid"
             plen = len(self._auto_path or [])
             reason = self._auto_reason or "-"
-            return f"Auto: target={target}  path={plen}  reason={reason}"
+            commit = int(self._auto_commit_left)
+            # show recent penalty/heat best-effort
+            bk = int(self._auto_last_back_penalty)
+            heat = int(self._auto_last_heat)
+            tie = "on" if float(self.cfg_tie_break_tiny) > 0 else "off"
+            return f"Auto: target={target}  path={plen}  commit={commit}  penalty=back {bk}, heat {heat}  tiebreak:{tie}  reason={reason}"
         except Exception:
             return ""
 
@@ -2157,6 +2453,8 @@ class Game:
                             cfg = _pl.get_config()
                             fov = int(((cfg.get("map") or {}).get("fov_radius") or FOV_RADIUS))
                             FOV_RADIUS = max(1, fov)
+                            # Also refresh autoplay tunables
+                            self._load_autoplay_config()
                         except Exception:
                             pass
                         # Decide toast/log
@@ -2320,6 +2618,7 @@ class Game:
                                                 cfg = _pl.get_config()
                                                 fov = int(((cfg.get("map") or {}).get("fov_radius") or FOV_RADIUS))
                                                 globals()["FOV_RADIUS"] = max(1, fov)
+                                                self._load_autoplay_config()
                                             except Exception:
                                                 pass
                                             self.logger.log(msg)

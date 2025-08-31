@@ -147,6 +147,28 @@ def _write_default_examples():
         except Exception:
             pass
 
+    # autoplay.json example with anti-oscillation and pathing parameters
+    autoplay_defaults = {
+        "api": "v1",
+        "autoplay": {
+            "backtrack_penalty_base": 3,
+            "backtrack_penalty_step": 2,
+            "backtrack_penalty_max": 10,
+            "visit_weight": 0.8,
+            "visit_cap": 8,
+            "commit_steps": 2,
+            "smoothing_max_skip": 1,
+            "tie_break_tiny": 0.01
+        }
+    }
+    autoplay_path = os.path.join(cfg_dir, "autoplay.json")
+    if not os.path.exists(autoplay_path):
+        try:
+            with open(autoplay_path, "w", encoding="utf-8") as f:
+                json.dump(autoplay_defaults, f, indent=2)
+        except Exception:
+            pass
+
 
 def _load_json_file(p: str) -> Dict[str, Any]:
     try:
@@ -738,4 +760,3 @@ def adjust_patch_priority(pid: str, new_priority: int) -> None:
     por = state.setdefault("priority_override", {})
     por[pid] = int(new_priority)
     _save_state(state)
-
