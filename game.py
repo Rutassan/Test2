@@ -58,6 +58,7 @@ FG_ORANGE = "\x1b[38;5;208m"
 
 DEFAULT_W = 40
 DEFAULT_H = 20
+# Field of view radius (can be overridden by external config)
 FOV_RADIUS = 8
 RIGHT_PANE_W = 38
 HUD_LOG_LINES = 7  # reserve 6–8 lines for folded log
@@ -77,6 +78,23 @@ ENEMY_TYPES: List[Tuple[str, str, str, str, int, int, int]] = [
     ("Troll", "T", FG_GREEN, FG_GREEN, 14, 5, 2),
     ("Shaman", "s", FG_ORANGE, FG_YELLOW, 9, 3, 2),
 ]
+
+# External patches/config bootstrapper and overrides
+try:
+    import patchloader as _pl
+    _pl.bootstrap()
+    # Apply enemy overrides and settings
+    try:
+        # Preserve defaults for merging
+        _ENEMY_TYPES_DEFAULT = list(ENEMY_TYPES)
+        ENEMY_TYPES = _pl.finalize_enemy_types(_ENEMY_TYPES_DEFAULT)
+        cfg = _pl.get_config()
+        fov = int(((cfg.get("map") or {}).get("fov_radius") or FOV_RADIUS))
+        FOV_RADIUS = max(1, fov)
+    except Exception:
+        pass
+except Exception:
+    _pl = None  # type: ignore
 
 
 class Logger:
@@ -1551,6 +1569,8 @@ class Game:
                 key = "RIGHT"
             elif code == 67:
                 key = "F9"
+            elif code == 68:
+                key = "F10"
         elif ch == "\r":
             key = "ENTER"
         elif ch == "\x1b":
@@ -1587,6 +1607,8 @@ class Game:
                     key = "RIGHT"
                 elif code == 67:
                     key = "F9"
+                elif code == 68:
+                    key = "F10"
             elif ch == "\r":
                 key = "ENTER"
             elif ch == "\x1b":
@@ -1678,6 +1700,23 @@ class Game:
         if self.ansi and self.auto_play:
             auto_line = FG_BRIGHT_GREEN + auto_line + RESET
         pane_top_lines.extend(self._wrap(auto_line, pane_w))
+        # Live patches status line
+        try:
+            if (_pl is not None):
+                st = _pl.get_live_status()
+                ts = st.get("last_time")
+                ts_str = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "N/A"
+                if st.get("enabled"):
+                    ok = st.get("last_ok")
+                    base = f"Live Patches: ON — last apply {'OK' if (ok is None or ok) else 'FAILED'} at {ts_str}"
+                    if self.ansi:
+                        if ok is False:
+                            base = FG_RED + base + RESET
+                        else:
+                            base = FG_BRIGHT_GREEN + base + RESET
+                    pane_top_lines.extend(self._wrap(base, pane_w))
+        except Exception:
+            pass
         if self.state in ("playing", "paused", "game_over"):
             if self.inspect_mode:
                 pane_top_lines.extend(self._wrap("[Осмотр]", pane_w))
@@ -1934,6 +1973,53 @@ class Game:
             # Draw initial menu
             self.render_frame(build_menu_frame(self))
             while True:
+                # Live auto-reload check
+                try:
+                    if ('_pl' in globals()) and (_pl is not None) and _pl.has_pending_reload():
+                        reasons = _pl.consume_reload_reasons()
+                        before = []
+                        try:
+                            before = [p.id for p in _pl.get_patches() if getattr(p, 'enabled', True)]
+                        except Exception:
+                            before = []
+                        ok, msg = _pl.reload_all()
+                        # Apply config overrides
+                        try:
+                            ENEMY_TYPES[:] = _pl.finalize_enemy_types(list(_ENEMY_TYPES_DEFAULT))
+                            cfg = _pl.get_config()
+                            fov = int(((cfg.get("map") or {}).get("fov_radius") or FOV_RADIUS))
+                            FOV_RADIUS = max(1, fov)
+                        except Exception:
+                            pass
+                        # Decide toast/log
+                        try:
+                            after = [p.id for p in _pl.get_patches() if getattr(p, 'enabled', True)]
+                            new = [x for x in after if x not in before]
+                            removed = [x for x in before if x not in after]
+                        except Exception:
+                            new, removed = [], []
+                        if ok:
+                            if ("config" in reasons) and (reasons == ["config"] or (len(reasons) == 1)):
+                                self.logger.log("Config updated — reloaded")
+                            elif ("assets" in reasons) and (reasons == ["assets"] or (len(reasons) == 1)):
+                                self.logger.log("Assets updated — reloaded")
+                            elif "patches" in reasons:
+                                if new:
+                                    self.logger.log(f"New patch: {new[0]} — applied")
+                                elif removed:
+                                    self.logger.log("Patch removed — reloaded")
+                                else:
+                                    self.logger.log("Patches updated — applied")
+                            elif "mods" in reasons:
+                                self.logger.log("Bot AI updated — next tick uses new logic")
+                            else:
+                                self.logger.log(msg)
+                        else:
+                            self.logger.log("Patch apply FAILED — reverted (see logs/loader.log)")
+                        self.recompute_fov()
+                        self.render_frame(self.build_frame())
+                except Exception:
+                    pass
                 if self.state == "menu":
                     allowed = {"UP", "DOWN", "LEFT", "RIGHT", "TAB", "ENTER", "ESC", "+", "-"}
                     key = self.read_key_blocking(allowed)
@@ -1998,7 +2084,7 @@ class Game:
                         while self.auto_play and self.state in ("playing", "paused"):
                             start = time.time()
                             # Handle hotkeys non-blocking
-                            allowed_keys = {"W", "A", "S", "D", "UP", "DOWN", "LEFT", "RIGHT", ".", "P", "R", "Q", "I", "H", "[", "]", "}"}
+                            allowed_keys = {"W", "A", "S", "D", "UP", "DOWN", "LEFT", "RIGHT", ".", "P", "R", "Q", "I", "H", "[", "]", "}", "F10"}
                             k = self.read_key_nonblocking(allowed_keys)
                             # Help modal: only allow H/Esc/Q/A; pause ticks
                             if self.help_mode:
@@ -2053,6 +2139,24 @@ class Game:
                                     self.render_frame(self.build_frame())
                                 elif k == "R":
                                     self.new_game(is_restart=True)
+                                    self.recompute_fov()
+                                    self.render_frame(self.build_frame())
+                                elif k == "F10":
+                                    try:
+                                        if _pl is not None:
+                                            ok, msg = _pl.reload_all()
+                                            # Re-apply config overrides
+                                            try:
+                                                # Update enemies and FOV
+                                                ENEMY_TYPES[:] = _pl.finalize_enemy_types(list(_ENEMY_TYPES_DEFAULT))
+                                                cfg = _pl.get_config()
+                                                fov = int(((cfg.get("map") or {}).get("fov_radius") or FOV_RADIUS))
+                                                globals()["FOV_RADIUS"] = max(1, fov)
+                                            except Exception:
+                                                pass
+                                            self.logger.log(msg)
+                                    except Exception:
+                                        self.logger.log("Reload failed.")
                                     self.recompute_fov()
                                     self.render_frame(self.build_frame())
                                 elif k == "I":
@@ -2374,14 +2478,18 @@ def build_help_frame(self: "Game") -> str:
         "Enemies: g Goblin green, a Archer cyan, p Priest magenta, T Troll green, s Shaman yellow",
         "> exit (if present)",
         "",
+        # Active patches/mods summary
+        ((_pl.get_active_summary() if ("_pl" in globals() and _pl is not None) else "").strip()),
+        "",
         "Controls:",
         "WASD/Arrows move; . wait; P pause; I inspect; H help; R restart; Q quit",
+        "F10: Reload Patches & Config",
         "Paused: S save, L load",
         "",
         "Auto-Play controls:",
-        "A — toggle, [ / ] — speed, } — fast, P — pause",
+        "A - toggle, [ / ] - speed, } - fast, P - pause",
         "",
-        "H/Esc — close",
+        "H/Esc - close",
     ]
     pane_lines: List[str] = []
     for s in legend:

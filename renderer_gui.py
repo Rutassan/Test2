@@ -5,10 +5,12 @@ import time
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
+from tkinter import filedialog
 from tkinter import font as tkfont
 from typing import Optional, Tuple, List
 
 from game import Game, RIGHT_PANE_W, HUD_LOG_LINES, visible_enemies_list, _dir_to_compass, _inspect_info_lines, build_help_frame
+import patchloader
 
 
 def enable_dpi_awareness():
@@ -310,6 +312,14 @@ class GuiApp:
 
         # Menu bar
         self._build_menu()
+        # Live watcher
+        try:
+            patchloader.start_watcher()
+        except Exception:
+            pass
+        # Periodic live-reload check
+        self._live_after_id = None
+        self._schedule_live_check()
 
         # Start a game immediately
         self.game.new_game(is_restart=False)
@@ -324,6 +334,11 @@ class GuiApp:
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self.menu_save)
         file_menu.add_command(label="Load", command=self.menu_load)
+        # Patches / Mods
+        file_menu.add_separator()
+        file_menu.add_command(label="Import Patch…", command=self.menu_import_patch)
+        file_menu.add_command(label="Reload Patches && Config (F10)", command=self.menu_reload)
+        file_menu.add_command(label="Manage Patches…", command=self.menu_manage_patches)
         file_menu.add_separator()
         # Auto-Play controls
         self.var_auto = tk.BooleanVar(value=self.game.auto_play)
@@ -346,12 +361,17 @@ class GuiApp:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_close)
         menubar.add_cascade(label="File", menu=file_menu)
+        settings_menu = tk.Menu(menubar, tearoff=False)
+        settings_menu.add_command(label="Open Config Folder", command=self.menu_open_config)
+        menubar.add_cascade(label="Settings", menu=settings_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
         help_menu.add_command(label="Controls & Legend", command=self.menu_help)
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.root.config(menu=menubar)
+        # Hot reload hotkey
+        self.root.bind("<F10>", lambda e: self.menu_reload())
 
     # ---------- Event Handlers ----------
     def on_resize(self, event):
@@ -797,7 +817,20 @@ class GuiApp:
             goal_line = goal_line or ""
             inv_line = inv_line or ""
         ar_line = f"Auto-Restart: {'ON' if (g.auto_restart_on_death and g.auto_restart_on_victory) else 'OFF'}"
-        pane_lines: List[str] = [status_line, controls_line, auto_line]
+        # Live status
+        try:
+            st = patchloader.get_live_status()
+            ts = st.get("last_time")
+            ts_str = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "N/A"
+            live_line = None
+            if st.get("enabled"):
+                ok = st.get("last_ok")
+                live_line = f"Live Patches: ON — last apply {'OK' if (ok is None or ok) else 'FAILED'} at {ts_str}"
+            pane_lines: List[str] = [status_line, controls_line, auto_line]
+            if live_line:
+                pane_lines.append(live_line)
+        except Exception:
+            pane_lines: List[str] = [status_line, controls_line, auto_line]
         if goal_line:
             pane_lines.append(goal_line)
         if inv_line:
@@ -840,8 +873,15 @@ class GuiApp:
         final_lines = top_lines + bottom_lines
         for i, line in enumerate(final_lines[:g.map.h]):
             fill = "#c0c0c0"
-            if line.strip().startswith("AUTO:") and g.auto_play:
-                fill = "#d8ffb0"
+            s = line.strip()
+            if s.startswith("AUTO:") and g.auto_play:
+                fill = "#d8ffb0"  # light green
+            elif s.startswith("Live Patches:"):
+                # Colorize by status keywords
+                if "FAILED" in s:
+                    fill = "#ffb0b0"  # light red
+                else:
+                    fill = "#b0ffb0"  # light green
             self.canvas.create_text(pane_x0, pane_y0 + i * tile, text=line.ljust(RIGHT_PANE_W), fill=fill, font=self.hud_font, anchor="nw")
 
         # Overlays (draw after HUD)
@@ -999,6 +1039,155 @@ class GuiApp:
         self.game.save_game()
         self._toast("Saved")
         self.redraw()
+
+    def menu_open_config(self):
+        p = patchloader.open_config_folder()
+        if p:
+            self._toast(f"Opened: {p}")
+        else:
+            self._toast("Open failed")
+
+    def menu_import_patch(self):
+        path = filedialog.askopenfilename(title="Import Patch", filetypes=[("Patch Zip", "*.zip"), ("All files", "*.*")])
+        if not path:
+            return
+        dst = patchloader.import_patch_zip(path)
+        if not dst:
+            messagebox.showerror("Import failed", "Could not import patch zip. See logs/loader.log")
+            return
+        # Show info from manifest if any
+        try:
+            # Rescan so get_patches sees the new file
+            patchloader.reload_all()
+            info = None
+            for p in patchloader.get_patches():
+                if os.path.basename(p.path) == os.path.basename(dst):
+                    info = p
+                    break
+            if info is not None:
+                self._toast(f"Installed patch {info.id} v{info.version} (priority {info.priority})")
+            else:
+                self._toast("Patch installed")
+        except Exception:
+            self._toast("Patch installed")
+
+    def menu_manage_patches(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Manage Patches")
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+        rows = []
+        ttk.Label(frm, text="Enabled").grid(row=0, column=0)
+        ttk.Label(frm, text="Priority").grid(row=0, column=1)
+        ttk.Label(frm, text="ID / File").grid(row=0, column=2)
+        patches = patchloader.get_patches()
+        for i, p in enumerate(patches, start=1):
+            var_en = tk.BooleanVar(value=p.enabled)
+            var_pr = tk.IntVar(value=p.priority)
+            ttk.Checkbutton(frm, variable=var_en).grid(row=i, column=0, padx=4)
+            sp = ttk.Spinbox(frm, from_=-999, to=999, textvariable=var_pr, width=6)
+            sp.grid(row=i, column=1, padx=4)
+            ttk.Label(frm, text=f"{p.id} v{p.version}  ({os.path.basename(p.path)})").grid(row=i, column=2, padx=6, sticky="w")
+            rows.append((p, var_en, var_pr))
+        btns = ttk.Frame(frm)
+        btns.grid(row=len(rows)+1, column=0, columnspan=3, pady=(10,0), sticky="e")
+        def apply_and_close():
+            for p, ven, vpr in rows:
+                try:
+                    patchloader.set_patch_enabled(p.id, bool(ven.get()))
+                    patchloader.adjust_patch_priority(p.id, int(vpr.get()))
+                except Exception:
+                    pass
+            dlg.destroy()
+            self.menu_reload()
+        ttk.Button(btns, text="OK", command=apply_and_close).grid(row=0, column=0, padx=5)
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).grid(row=0, column=1)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.wait_visibility()
+        dlg.focus()
+
+    def menu_reload(self):
+        # Stop auto timers first
+        self.game.auto_play = False
+        try:
+            self.var_auto.set(False)
+        except Exception:
+            pass
+        self._ensure_auto()
+        ok, msg = patchloader.reload_all()
+        # Apply config overrides to game module
+        try:
+            import game as game_mod
+            # Update ENEMY_TYPES and FOV
+            base_defaults = list(getattr(game_mod, "_ENEMY_TYPES_DEFAULT", list(game_mod.ENEMY_TYPES)))
+            game_mod.ENEMY_TYPES[:] = patchloader.finalize_enemy_types(base_defaults)
+            cfg = patchloader.get_config()
+            fov = int(((cfg.get("map") or {}).get("fov_radius") or game_mod.FOV_RADIUS))
+            game_mod.FOV_RADIUS = max(1, fov)
+        except Exception:
+            pass
+        self._toast(msg)
+        # Redraw HUD/help/legend
+        self.game.recompute_fov()
+        self.redraw()
+
+    # ---------- Live Watcher ----------
+    def _schedule_live_check(self):
+        try:
+            if self._live_after_id:
+                self.root.after_cancel(self._live_after_id)
+        except Exception:
+            pass
+        # Poll every ~350ms
+        self._live_after_id = self.root.after(350, self._check_live_reload)
+
+    def _check_live_reload(self):
+        try:
+            if patchloader.has_pending_reload():
+                reasons = patchloader.consume_reload_reasons()
+                before = [p.id for p in patchloader.get_patches() if getattr(p, 'enabled', True)]
+                ok, _ = patchloader.reload_all()
+                # Apply config overrides to game module
+                try:
+                    import game as game_mod
+                    base_defaults = list(getattr(game_mod, "_ENEMY_TYPES_DEFAULT", list(game_mod.ENEMY_TYPES)))
+                    game_mod.ENEMY_TYPES[:] = patchloader.finalize_enemy_types(base_defaults)
+                    cfg = patchloader.get_config()
+                    fov = int(((cfg.get("map") or {}).get("fov_radius") or game_mod.FOV_RADIUS))
+                    game_mod.FOV_RADIUS = max(1, fov)
+                except Exception:
+                    pass
+                # Toasts according to reasons and diff
+                after = [p.id for p in patchloader.get_patches() if getattr(p, 'enabled', True)]
+                new = [x for x in after if x not in before]
+                removed = [x for x in before if x not in after]
+                if ok:
+                    if ("config" in reasons) and (len(reasons) == 1):
+                        self._toast("Config updated — reloaded")
+                    elif ("assets" in reasons) and (len(reasons) == 1):
+                        self._toast("Assets updated — reloaded")
+                    elif "patches" in reasons:
+                        if new:
+                            self._toast(f"New patch: {new[0]} — applied")
+                        elif removed:
+                            self._toast("Patch removed — reloaded")
+                        else:
+                            self._toast("Patches updated — applied")
+                    elif "mods" in reasons:
+                        self._toast("Bot AI updated — next tick uses new logic")
+                    else:
+                        self._toast("Reloaded patches: OK")
+                else:
+                    self._toast("Patch apply FAILED — reverted")
+                # Redraw HUD/help/legend
+                self.game.recompute_fov()
+                self.redraw()
+        except Exception:
+            pass
+        finally:
+            self._schedule_live_check()
 
     def menu_load(self):
         if self.game.load_game():
