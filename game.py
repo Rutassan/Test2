@@ -101,12 +101,33 @@ class Tile:
         self.walkable = walkable
 
 
+class Door:
+    def __init__(self, x: int, y: int, open_: bool = False, locked: bool = False):
+        self.x = int(x)
+        self.y = int(y)
+        self.open = bool(open_)
+        self.locked = bool(locked)
+
+    def serialize(self) -> Dict[str, Any]:
+        return {"x": self.x, "y": self.y, "open": self.open, "locked": self.locked}
+
+    @staticmethod
+    def deserialize(data: Dict[str, Any]) -> "Door":
+        return Door(int(data.get("x", 0)), int(data.get("y", 0)), bool(data.get("open", False)), bool(data.get("locked", False)))
+
+
 class Map:
     def __init__(self, w: int, h: int):
         self.w = w
         self.h = h
         self.tiles: List[List[Tile]] = [[Tile(False) for _ in range(w)] for _ in range(h)]
         self.explored: List[List[bool]] = [[False for _ in range(w)] for _ in range(h)]
+        # Rooms/corridors generator state
+        self.gen_type: str = "caves"  # "caves" or "rooms"
+        self.rooms: List[Tuple[int, int, int, int]] = []  # list of (x1,y1,x2,y2) inclusive bounds
+        self.room_centers: List[Tuple[int, int]] = []
+        # Doors as a mapping for quick checks
+        self.doors: Dict[Tuple[int, int], Door] = {}
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.w and 0 <= y < self.h
@@ -116,13 +137,87 @@ class Map:
             return False
         return self.tiles[y][x].walkable
 
+    def has_door(self, x: int, y: int) -> bool:
+        return (x, y) in self.doors
+
+    def door_at(self, x: int, y: int) -> Optional[Door]:
+        return self.doors.get((x, y))
+
+    def blocks_sight(self, x: int, y: int) -> bool:
+        if not self.in_bounds(x, y):
+            return True
+        # Walls block sight
+        if not self.tiles[y][x].walkable:
+            return True
+        # Closed doors block sight
+        d = self.doors.get((x, y))
+        if d and not d.open:
+            return True
+        return False
+
     def carve(self, x: int, y: int):
         if self.in_bounds(x, y):
             self.tiles[y][x].walkable = True
 
-    def generate(self, rng: random.Random):
+    def _flood_fill_reachable(self, sx: int, sy: int) -> List[List[bool]]:
+        directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        reachable = [[False for _ in range(self.w)] for _ in range(self.h)]
+        stack = [(sx, sy)]
+        while stack:
+            cx, cy = stack.pop()
+            if not (0 <= cx < self.w and 0 <= cy < self.h):
+                continue
+            if reachable[cy][cx] or not self.tiles[cy][cx].walkable:
+                continue
+            # Doors: treat closed doors as walkable for connectivity
+            d = self.doors.get((cx, cy))
+            if d and d.locked:
+                # still reachable cell, we consider corridor connectivity regardless of locked
+                pass
+            reachable[cy][cx] = True
+            for dx, dy in directions:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < self.w and 0 <= ny < self.h and not reachable[ny][nx] and self.tiles[ny][nx].walkable:
+                    stack.append((nx, ny))
+        return reachable
+
+    def _enforce_connected(self, sx: int, sy: int):
+        reachable = self._flood_fill_reachable(sx, sy)
+        for y in range(self.h):
+            for x in range(self.w):
+                if self.tiles[y][x].walkable and not reachable[y][x]:
+                    self.tiles[y][x].walkable = False
+
+    def _intersect(self, r1: Tuple[int, int, int, int], r2: Tuple[int, int, int, int]) -> bool:
+        ax1, ay1, ax2, ay2 = r1
+        bx1, by1, bx2, by2 = r2
+        return not (ax2 < bx1 or bx2 < ax1 or ay2 < by1 or by2 < ay1)
+
+    def _center(self, r: Tuple[int, int, int, int]) -> Tuple[int, int]:
+        x1, y1, x2, y2 = r
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+    def _carve_rect(self, x1: int, y1: int, x2: int, y2: int):
+        for y in range(max(1, y1), min(self.h - 1, y2 + 1)):
+            for x in range(max(1, x1), min(self.w - 1, x2 + 1)):
+                self.tiles[y][x].walkable = True
+
+    def _place_door(self, x: int, y: int):
+        if not self.in_bounds(x, y):
+            return
+        if (x, y) in self.doors:
+            return
+        if not self.tiles[y][x].walkable:
+            # don't place door on walls, ensure corridor carved first
+            return
+        self.doors[(x, y)] = Door(x, y, open_=False, locked=False)
+
+    def generate_caves(self, rng: random.Random):
+        self.gen_type = "caves"
+        self.rooms = []
+        self.room_centers = []
+        self.doors = {}
         # Drunkard walk generation ensuring connectivity
-        # Start from center
         self.tiles = [[Tile(False) for _ in range(self.w)] for _ in range(self.h)]
         self.explored = [[False for _ in range(self.w)] for _ in range(self.h)]
         start_x = self.w // 2
@@ -143,44 +238,94 @@ class Map:
                     carved += 1
                 x, y = nx, ny
             attempts += 1
-        # Add some random room carves for openness, but ensure adjacency to existing floor
-        for _ in range(20):
-            rx = rng.randrange(1, self.w - 2)
-            ry = rng.randrange(1, self.h - 2)
-            rw = rng.randrange(2, 6)
-            rh = rng.randrange(2, 5)
-            has_adjacent = False
-            for yy in range(max(1, ry - 1), min(self.h - 1, ry + rh + 1)):
-                for xx in range(max(1, rx - 1), min(self.w - 1, rx + rw + 1)):
-                    if self.tiles[yy][xx].walkable:
-                        has_adjacent = True
-                        break
-                if has_adjacent:
-                    break
-            if not has_adjacent:
-                continue
-            for yy in range(ry, min(self.h - 1, ry + rh)):
-                for xx in range(rx, min(self.w - 1, rx + rw)):
-                    self.tiles[yy][xx].walkable = True
+        # Enforce single connected component
+        self._enforce_connected(start_x, start_y)
 
-        # Enforce single connected component: flood fill from start, wall off unreachable floors
-        reachable = [[False for _ in range(self.w)] for _ in range(self.h)]
-        stack = [(start_x, start_y)]
-        while stack:
-            cx, cy = stack.pop()
-            if not (0 <= cx < self.w and 0 <= cy < self.h):
+    def generate_rooms(self, rng: random.Random, min_rooms: int = 8, max_rooms: int = 14):
+        self.gen_type = "rooms"
+        self.rooms = []
+        self.room_centers = []
+        self.doors = {}
+        self.tiles = [[Tile(False) for _ in range(self.w)] for _ in range(self.h)]
+        self.explored = [[False for _ in range(self.w)] for _ in range(self.h)]
+        n_rooms = rng.randint(max(1, int(min_rooms)), max(2, int(max_rooms)))
+        attempts = n_rooms * 8
+        # Place rooms without overlapping (1-tile buffer)
+        while len(self.rooms) < n_rooms and attempts > 0:
+            attempts -= 1
+            rw = rng.randint(4, max(4, min(10, self.w // 5)))
+            rh = rng.randint(3, max(3, min(8, self.h // 5)))
+            rx = rng.randint(1, max(1, self.w - rw - 2))
+            ry = rng.randint(1, max(1, self.h - rh - 2))
+            rect = (rx, ry, rx + rw - 1, ry + rh - 1)
+            # Expand rect by 1 for overlap test (buffer)
+            inflated = (rect[0] - 1, rect[1] - 1, rect[2] + 1, rect[3] + 1)
+            if any(self._intersect(inflated, r) for r in self.rooms):
                 continue
-            if reachable[cy][cx] or not self.tiles[cy][cx].walkable:
-                continue
-            reachable[cy][cx] = True
-            for dx, dy in directions:
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < self.w and 0 <= ny < self.h and not reachable[ny][nx] and self.tiles[ny][nx].walkable:
-                    stack.append((nx, ny))
-        for y in range(self.h):
-            for x in range(self.w):
-                if self.tiles[y][x].walkable and not reachable[y][x]:
-                    self.tiles[y][x].walkable = False
+            self.rooms.append(rect)
+            self._carve_rect(*rect)
+        # Fallback: if no rooms placed, carve a central hall
+        if not self.rooms:
+            self._carve_rect(2, 2, self.w - 3, self.h - 3)
+            self.rooms.append((2, 2, self.w - 3, self.h - 3))
+
+        # Compute centers
+        self.room_centers = [self._center(r) for r in self.rooms]
+        # Connect rooms in order of centers
+        order = list(range(len(self.rooms)))
+        order.sort(key=lambda i: (self.room_centers[i][0], self.room_centers[i][1]))
+        for i in range(1, len(order)):
+            a = self.rooms[order[i - 1]]
+            b = self.rooms[order[i]]
+            ax, ay = self._center(a)
+            bx, by = self._center(b)
+            # L-shaped corridor; randomize order of segments
+            if rng.random() < 0.5:
+                path = [(x, ay) for x in range(min(ax, bx), max(ax, bx) + 1)] + [(bx, y) for y in range(min(ay, by), max(ay, by) + 1)]
+            else:
+                path = [(ax, y) for y in range(min(ay, by), max(ay, by) + 1)] + [(x, by) for x in range(min(ax, bx), max(ax, bx) + 1)]
+            prev_in_room: Optional[int] = None  # room index
+            for j, (x, y) in enumerate(path):
+                if 1 <= x < self.w - 1 and 1 <= y < self.h - 1:
+                    # Carve corridor
+                    self.tiles[y][x].walkable = True
+                    # Slightly widen corridor randomly
+                    if rng.random() < 0.25:
+                        for dx, dy in ((1, 0), (-1, 0)):
+                            nx, ny = x + dx, y + dy
+                            if 1 <= nx < self.w - 1 and 1 <= ny < self.h - 1:
+                                self.tiles[ny][nx].walkable = True
+                    # Door placement on room boundary crossings
+                    # Identify if this tile is inside any room
+                    in_idx: Optional[int] = None
+                    for idx, r in enumerate(self.rooms):
+                        x1, y1, x2, y2 = r
+                        if x1 <= x <= x2 and y1 <= y <= y2:
+                            in_idx = idx
+                            break
+                    if in_idx is not None and (prev_in_room is None or prev_in_room != in_idx):
+                        # Entered a room from corridor: place door at this position
+                        self._place_door(x, y)
+                    prev_in_room = in_idx
+        # Ensure connectivity from first room center
+        sx, sy = self._center(self.rooms[0]) if self.rooms else (self.w // 2, self.h // 2)
+        self._enforce_connected(sx, sy)
+        # Optionally mark 1-2 doors as locked (if any doors exist)
+        door_keys = list(self.doors.keys())
+        if door_keys:
+            locked_count = rng.randint(0, min(2, len(door_keys)))
+            rng.shuffle(door_keys)
+            for (dx, dy) in door_keys[:locked_count]:
+                d = self.doors[(dx, dy)]
+                d.locked = True
+                d.open = False
+
+    def generate(self, rng: random.Random):
+        # Dispatch to selected generator type
+        if getattr(self, "gen_type", "caves") == "rooms":
+            self.generate_rooms(rng)
+        else:
+            self.generate_caves(rng)
 
     def serialize(self) -> Dict[str, Any]:
         return {
@@ -188,6 +333,9 @@ class Map:
             "h": self.h,
             "tiles": [[1 if self.tiles[y][x].walkable else 0 for x in range(self.w)] for y in range(self.h)],
             "explored": self.explored,
+            "gen_type": getattr(self, "gen_type", "caves"),
+            "rooms": list(self.rooms),
+            "doors": [d.serialize() for d in self.doors.values()],
         }
 
     @staticmethod
@@ -197,6 +345,13 @@ class Map:
             for x in range(m.w):
                 m.tiles[y][x].walkable = bool(data["tiles"][y][x])
         m.explored = data.get("explored", [[False for _ in range(m.w)] for _ in range(m.h)])
+        m.gen_type = data.get("gen_type", "caves")
+        m.rooms = [tuple(r) for r in data.get("rooms", [])]
+        m.room_centers = [((r[0] + r[2]) // 2, (r[1] + r[3]) // 2) for r in m.rooms]
+        m.doors = {}
+        for dd in data.get("doors", []):
+            d = Door.deserialize(dd)
+            m.doors[(d.x, d.y)] = d
         return m
 
 
@@ -228,6 +383,8 @@ class Entity:
         self.hp = hp
         self.max_hp = hp
         self.power = power
+        # Timed effects: name -> {"dur": int, ...params}
+        self.effects: Dict[str, Dict[str, Any]] = {}
 
     def pos(self) -> Tuple[int, int]:
         return self.x, self.y
@@ -244,12 +401,19 @@ class Entity:
             "hp": self.hp,
             "max_hp": self.max_hp,
             "power": self.power,
+            "effects": {k: dict(v) for k, v in self.effects.items()},
         }
 
     @staticmethod
     def deserialize(data: Dict[str, Any], color_visible: str, color_dim: str) -> "Entity":
         e = Entity(data["x"], data["y"], data["ch"], color_visible, color_dim, data["name"], data["hp"], data["power"])
         e.max_hp = data.get("max_hp", e.hp)
+        try:
+            eff = data.get("effects", {}) or {}
+            if isinstance(eff, dict):
+                e.effects = {str(k): dict(v) for k, v in eff.items() if isinstance(v, dict)}
+        except Exception:
+            e.effects = {}
         return e
 
 
@@ -266,7 +430,7 @@ class Game:
         self.exit_x: Optional[int] = None
         self.exit_y: Optional[int] = None
         self.items: List[Item] = []
-        self.inventory: Dict[str, int] = {"potion": 0}
+        self.inventory: Dict[str, int] = {"potion": 0, "key": 0}
         self.visible: List[List[bool]] = [[False for _ in range(self.map.w)] for _ in range(self.map.h)]
         self.logger = Logger()
         # Menu settings
@@ -275,7 +439,10 @@ class Game:
         self.menu_width: int = DEFAULT_W
         self.menu_height: int = DEFAULT_H
         self.menu_enemies: int = 8
-        self.menu_sel: int = 0  # 0=Seed,1=Width,2=Height,3=Enemies
+        # Extra menu settings
+        self.menu_tier: int = 1  # 1,2,3
+        self.menu_use_rooms: bool = True
+        self.menu_sel: int = 0  # 0=Seed,1=Width,2=Height,3=Enemies,4=Tier,5=Rooms?
         # Terminal capabilities
         self.ansi: bool = enable_ansi()
         hide_cursor(self.ansi)
@@ -314,6 +481,9 @@ class Game:
         self.run_dmg_dealt: int = 0
         self.run_dmg_taken: int = 0
         self.run_items_used: int = 0
+        self.run_kills_by_role: Dict[str, int] = {}
+        self.run_times_hexed: int = 0
+        self.run_shots_dodged: int = 0
 
     def random_enemy(self) -> Entity:
         """Return a newly created random enemy Entity using internal RNG.
@@ -343,13 +513,21 @@ class Game:
         self.rng = random.Random(self.seed)
         # Resize map if needed
         self.map = Map(self.menu_width, self.menu_height)
+        # Select generator
+        self.map.gen_type = "rooms" if getattr(self, "menu_use_rooms", True) else "caves"
         self.visible = [[False for _ in range(self.map.w)] for _ in range(self.map.h)]
         self.map.generate(self.rng)
         self.turn = 1
         # Place player
         self.player = Entity(0, 0, "@", FG_BRIGHT_WHITE, FG_BRIGHT_WHITE, "Player", 20, 5)
         self.player.max_hp = 20
-        self.place_entity_random_floor(self.player)
+        self.player.effects = {}
+        # Prefer room center if rooms generator
+        if self.map.gen_type == "rooms" and self.map.room_centers:
+            cx, cy = self.rng.choice(self.map.room_centers)
+            self.player.x, self.player.y = cx, cy
+        else:
+            self.place_entity_random_floor(self.player)
         # Place enemies
         self.enemies = []
         # Place exit and items/inventory
@@ -357,23 +535,38 @@ class Game:
         # Exit will be placed after player placement
         # Clear items and inventory
         self.items = []
-        self.inventory = {"potion": 0}
+        self.inventory = {"potion": 0, "key": 0}
         # Clear ephemeral/visual-only state
         self.damage_events = []
         self.corpses = []
-        for _ in range(max(0, self.menu_enemies)):
+        # Difficulty scaling for enemy count
+        enemy_count = max(0, int(self.menu_enemies))
+        if getattr(self, "menu_tier", 1) == 2:
+            enemy_count = int(math.ceil(enemy_count * 1.25))
+        elif getattr(self, "menu_tier", 1) == 3:
+            enemy_count = int(math.ceil(enemy_count * 1.5))
+        for _ in range(enemy_count):
             e = self.random_enemy()
+            # Tier-based tweaks for elites
+            if getattr(self, "menu_tier", 1) >= 2 and e.name in ("Troll", "Shaman"):
+                e.power += 1
             self.place_entity_random_floor(e, avoid=[self.player] + self.enemies)
             self.enemies.append(e)
-        # Place exit now that player and enemies are positioned
+        # Place exit now
         self._place_exit()
-        # Spawn potions
-        self._spawn_potions()
+        # Spawn loot (potions in rooms, keys if locked doors exist)
+        try:
+            self._spawn_loot()
+        except Exception:
+            self._spawn_potions()
         # Reset run metrics
         self.run_kills = 0
         self.run_dmg_dealt = 0
         self.run_dmg_taken = 0
         self.run_items_used = 0
+        self.run_kills_by_role = {}
+        self.run_times_hexed = 0
+        self.run_shots_dodged = 0
         if is_restart:
             self.logger.log("Restarted.")
         else:
@@ -382,15 +575,37 @@ class Game:
         self.recompute_fov()
 
     def _place_exit(self):
-        # Choose a walkable farthest tile from player
+        # Place Exit in the farthest room if rooms-gen; otherwise farthest floor tile
         px, py = self.player.x, self.player.y
-
-        # 0) If low HP and have potion -> use it
-        try:
-            if self.player.hp <= max(1, int(self.player.max_hp * 0.4)) and self.inventory.get("potion", 0) > 0:
-                return ("use_potion", None, None, "use potion")
-        except Exception:
-            pass
+        if self.map.gen_type == "rooms" and self.map.rooms:
+            # Find room containing player (or nearest)
+            def center_of(r):
+                x1, y1, x2, y2 = r
+                return ((x1 + x2) // 2, (y1 + y2) // 2)
+            player_center = (px, py)
+            best_idx = None
+            best_d = -1
+            for idx, r in enumerate(self.map.rooms):
+                cx, cy = center_of(r)
+                d = abs(cx - px) + abs(cy - py)
+                if d > best_d:
+                    best_d = d
+                    best_idx = idx
+            if best_idx is not None:
+                x1, y1, x2, y2 = self.map.rooms[best_idx]
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                # Find a walkable spot near center
+                cand = [(cx, cy)]
+                for yy in range(y1, y2 + 1):
+                    for xx in range(x1, x2 + 1):
+                        if self.map.is_walkable(xx, yy):
+                            cand.append((xx, yy))
+                # Pick farthest from player in that room
+                cand.sort(key=lambda t: -(abs(t[0] - player_center[0]) + abs(t[1] - player_center[1])))
+                bx, by = cand[0]
+                self.exit_x, self.exit_y = bx, by
+                return
+        # Fallback: farthest walkable
         best: Optional[Tuple[int, int]] = None
         best_d = -1
         for y in range(1, self.map.h - 1):
@@ -430,6 +645,64 @@ class Game:
             if self.rng.random() < p:
                 self.items.append(Item(x, y, "potion"))
                 count -= 1
+
+    def _spawn_loot(self):
+        # Potions more often inside rooms; keys if locked doors exist
+        potions = 0
+        base_potions = self.rng.randint(2, 4)
+        if getattr(self, "menu_tier", 1) >= 2:
+            base_potions += 1
+        # Spawn inside rooms if any
+        if self.map.gen_type == "rooms" and self.map.rooms:
+            rooms = list(self.map.rooms)
+            self.rng.shuffle(rooms)
+            for r in rooms:
+                if potions >= base_potions:
+                    break
+                x1, y1, x2, y2 = r
+                for _ in range(8):
+                    x = self.rng.randint(x1, x2)
+                    y = self.rng.randint(y1, y2)
+                    if self.map.is_walkable(x, y) and (x, y) != (self.player.x, self.player.y) and not any((e.x, e.y) == (x, y) for e in self.enemies):
+                        self.items.append(Item(x, y, "potion"))
+                        potions += 1
+                        break
+        # Fallback scatter
+        while potions < base_potions:
+            x = self.rng.randrange(1, self.map.w - 1)
+            y = self.rng.randrange(1, self.map.h - 1)
+            if self.map.is_walkable(x, y) and (x, y) != (self.player.x, self.player.y):
+                self.items.append(Item(x, y, "potion"))
+                potions += 1
+
+        # Keys for locked doors
+        locked_doors = [d for d in self.map.doors.values() if d.locked]
+        if locked_doors:
+            key_needed = min(2, len(locked_doors))
+            placed = 0
+            # Prefer rooms near start
+            if self.map.gen_type == "rooms" and self.map.rooms:
+                rooms = list(self.map.rooms)
+                # sort by distance to player
+                rooms.sort(key=lambda r: abs(((r[0]+r[2])//2) - self.player.x) + abs(((r[1]+r[3])//2) - self.player.y))
+                for r in rooms:
+                    if placed >= key_needed:
+                        break
+                    x1, y1, x2, y2 = r
+                    for _ in range(10):
+                        x = self.rng.randint(x1, x2)
+                        y = self.rng.randint(y1, y2)
+                        if self.map.is_walkable(x, y) and (x, y) != (self.player.x, self.player.y) and not any((e.x, e.y) == (x, y) for e in self.enemies):
+                            self.items.append(Item(x, y, "key"))
+                            placed += 1
+                            break
+            # Fallback scatter
+            while placed < key_needed:
+                x = self.rng.randrange(1, self.map.w - 1)
+                y = self.rng.randrange(1, self.map.h - 1)
+                if self.map.is_walkable(x, y):
+                    self.items.append(Item(x, y, "key"))
+                    placed += 1
 
     def place_entity_random_floor(self, ent: Entity, avoid: Optional[List[Entity]] = None):
         if avoid is None:
@@ -477,7 +750,7 @@ class Game:
                 continue
             if x == x1 and y == y1:
                 return True
-            if not self.map.is_walkable(x, y):
+            if self.map.blocks_sight(x, y):
                 return False
         return True
 
@@ -501,6 +774,10 @@ class Game:
     def is_blocked(self, x: int, y: int) -> bool:
         if not self.map.is_walkable(x, y):
             return True
+        # Doors: treat closed doors as blocking for generic check; special handling in move_entity
+        d = self.map.door_at(x, y)
+        if d and not d.open:
+            return True
         if self.player.x == x and self.player.y == y and self.player.is_alive():
             return True
         for e in self.enemies:
@@ -520,6 +797,24 @@ class Game:
                 if self.player.x == nx and self.player.y == ny and self.player.is_alive():
                     target = self.player
             if target is None:
+                # Doors handling
+                d = self.map.door_at(nx, ny)
+                if d and not d.open:
+                    if ent is self.player:
+                        # Check locked and key
+                        if d.locked and int(self.inventory.get("key", 0)) <= 0:
+                            # Can't enter locked door without key
+                            self.logger.log("Auto: need Key")
+                            return
+                        # Open the door and step in
+                        d.open = True
+                        if self.auto_play:
+                            self.logger.log("Auto: door→open")
+                    else:
+                        # Enemies can open normal (unlocked) doors; locked block them
+                        if d.locked:
+                            return
+                        d.open = True
                 ent.x, ent.y = nx, ny
                 if ent is self.player:
                     # Pickup items and check exit
@@ -531,7 +826,7 @@ class Game:
                     self.attack(ent, target)
 
     def attack(self, attacker: Entity, defender: Entity):
-        dmg = attacker.power
+        dmg = self._compute_damage(attacker, defender)
         defender.hp -= dmg
         # One-frame flash at defender location
         self.flash_positions.append((defender.x, defender.y))
@@ -572,6 +867,12 @@ class Game:
                     self.corpses.append((defender.x, defender.y, defender.name or defender.ch))
                 except Exception:
                     pass
+                # Track kills by role
+                try:
+                    if attacker is self.player:
+                        self.run_kills_by_role[defender.name] = self.run_kills_by_role.get(defender.name, 0) + 1
+                except Exception:
+                    pass
 
         # Track run metrics
         try:
@@ -590,33 +891,127 @@ class Game:
                 continue
             if not self.player.is_alive():
                 break
-            # If adjacent to player, attack
-            if abs(e.x - self.player.x) + abs(e.y - self.player.y) == 1:
+            ex, ey = e.x, e.y
+            px, py = self.player.x, self.player.y
+            dist_manh = abs(ex - px) + abs(ey - py)
+            name_l = (e.name or "").lower()
+            acted = False
+            # Adjacent melee always takes precedence
+            if abs(ex - px) + abs(ey - py) == 1:
                 self.attack(e, self.player)
-                continue
-            # If has line of sight, move towards player
-            if self.has_los(e.x, e.y, self.player.x, self.player.y, radius=12):
-                dx = 0 if e.x == self.player.x else (1 if self.player.x > e.x else -1)
-                dy = 0 if e.y == self.player.y else (1 if self.player.y > e.y else -1)
-                # Try axis that is farther first
-                if abs(self.player.x - e.x) >= abs(self.player.y - e.y):
-                    if not self.is_blocked(e.x + dx, e.y):
-                        e.x += dx
-                    elif not self.is_blocked(e.x, e.y + dy):
-                        e.y += dy
-                else:
-                    if not self.is_blocked(e.x, e.y + dy):
-                        e.y += dy
-                    elif not self.is_blocked(e.x + dx, e.y):
-                        e.x += dx
+                acted = True
             else:
-                # Wander randomly 30% of the time
-                if self.rng.random() < 0.3:
-                    dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)]
-                    dx, dy = self.rng.choice(dirs)
-                    if not self.is_blocked(e.x + dx, e.y + dy):
-                        e.x += dx
-                        e.y += dy
+                if name_l == "archer":
+                    # Archer: Aim/Shot at 2-5 tiles if straight LOS
+                    in_line = (ex == px or ey == py)
+                    has = self.has_los(ex, ey, px, py, radius=12) if in_line else False
+                    within = 2 <= max(abs(ex - px), abs(ey - py)) <= 5
+                    aim = self._get_effect(e, "Aim")
+                    aimcd = self._get_effect(e, "AimCD")
+                    if aim and int(aim.get("dur", 0)) > 0:
+                        # Attempt to shoot
+                        if has and within:
+                            dmg = self._compute_damage(e, self.player)
+                            self.attack(e, self.player)
+                            try:
+                                self.logger.log(f"Archer shoots (-{dmg})")
+                            except Exception:
+                                pass
+                            # Clear Aim; set cooldown
+                            self._remove_effect(e, "Aim")
+                            cd = 2 if getattr(self, "menu_tier", 1) < 3 else 1
+                            self._set_effect(e, "AimCD", cd)
+                            acted = True
+                        else:
+                            # Lost LOS; drop aim
+                            self._remove_effect(e, "Aim")
+                    elif (not aimcd) and has and within:
+                        # Start aiming
+                        self._set_effect(e, "Aim", 1, mul=2.0)
+                        try:
+                            self.logger.log("Archer aims")
+                        except Exception:
+                            pass
+                        acted = True
+                elif name_l == "priest":
+                    # Shield wounded ally/self
+                    cand: List[Entity] = []
+                    for a in self.enemies + [e]:
+                        if a.is_alive() and a.hp < a.max_hp:
+                            cand.append(a)
+                    if cand:
+                        # pick closest
+                        cand.sort(key=lambda a: abs(a.x - ex) + abs(a.y - ey))
+                        tgt = cand[0]
+                        self._apply_shield(tgt, amount=3, dur=3)
+                        nm = "You" if tgt is self.player else (tgt.name or "ally")
+                        try:
+                            self.logger.log(f"Priest shields {nm} (+3 temp)")
+                        except Exception:
+                            pass
+                        acted = True
+                elif name_l == "shaman":
+                    # Prefer Frenzy if many allies nearby; Tier 3: buff more often (>=1 nearby)
+                    allies_near = [a for a in self.enemies if a.is_alive() and (abs(a.x - ex) + abs(a.y - ey)) <= 3 and a is not e]
+                    tier = int(getattr(self, "menu_tier", 1))
+                    should_frenzy = False
+                    if len(allies_near) >= 2:
+                        should_frenzy = True
+                    elif tier >= 3 and len(allies_near) >= 1:
+                        should_frenzy = True
+                    if should_frenzy and allies_near:
+                        tgt = self.rng.choice(allies_near)
+                        self._apply_frenzy(tgt, atk_bonus=1, dur=3)
+                        try:
+                            self.logger.log(f"Shaman empowers {tgt.name} (+1 ATK)")
+                        except Exception:
+                            pass
+                        acted = True
+                    else:
+                        self._apply_hex(self.player, atk_penalty=1, dur=3)
+                        try:
+                            self.logger.log("Shaman hexes Player (-1 ATK)")
+                        except Exception:
+                            pass
+                        acted = True
+
+            # Default movement if no action taken
+            if not acted:
+                if self.has_los(ex, ey, px, py, radius=12):
+                    dx = 0 if ex == px else (1 if px > ex else -1)
+                    dy = 0 if ey == py else (1 if py > ey else -1)
+                    if abs(px - ex) >= abs(py - ey):
+                        if not self.is_blocked(ex + dx, ey):
+                            e.x += dx
+                        elif not self.is_blocked(ex, ey + dy):
+                            e.y += dy
+                    else:
+                        if not self.is_blocked(ex, ey + dy):
+                            e.y += dy
+                        elif not self.is_blocked(ex + dx, ey):
+                            e.x += dx
+                else:
+                    if self.rng.random() < 0.3:
+                        dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)]
+                        dx, dy = self.rng.choice(dirs)
+                        if not self.is_blocked(ex + dx, ey + dy):
+                            e.x += dx
+                            e.y += dy
+
+            # End-of-turn effects for this enemy
+            if name_l == "troll" and e.is_alive():
+                regen = 2 if getattr(self, "menu_tier", 1) >= 3 else 1
+                if e.hp > 0 and e.hp < e.max_hp:
+                    before = e.hp
+                    e.hp = min(e.max_hp, e.hp + regen)
+                    if e.hp > before:
+                        if hasattr(self, "_digest") and self._digest is not None:
+                            for _ in range(e.hp - before):
+                                self._digest.record_effect("Regen")
+                        else:
+                            self.logger.log(f"Troll regenerates (+{e.hp - before})")
+            # Decrement durations (AimCD, buffs, etc.)
+            self._decay_effects(e)
 
     def handle_player_action(self, key: str) -> bool:
         # Returns True if turn consumed
@@ -651,17 +1046,24 @@ class Game:
     # ---------- Items & Exit ----------
     def _pickup_items_at(self, x: int, y: int):
         picked = 0
+        picked_keys = 0
         remaining: List[Item] = []
         for it in self.items:
             if (it.x, it.y) == (x, y):
                 if it.kind == "potion":
                     self.inventory["potion"] = self.inventory.get("potion", 0) + 1
                     picked += 1
+                elif it.kind == "key":
+                    self.inventory["key"] = self.inventory.get("key", 0) + 1
+                    picked_keys += 1
             else:
                 remaining.append(it)
         if picked > 0:
             self.items = remaining
             self.logger.log(f"Picked up Potion x{picked}.")
+        if picked_keys > 0:
+            self.items = remaining
+            self.logger.log(f"Picked up Key x{picked_keys}.")
 
     def use_potion(self, manual: bool = False) -> bool:
         cnt = int(self.inventory.get("potion", 0))
@@ -700,8 +1102,16 @@ class Game:
         cand = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
         out: List[Tuple[int, int]] = []
         for nx, ny in cand:
-            if self.map.in_bounds(nx, ny) and self.map.is_walkable(nx, ny):
-                out.append((nx, ny))
+            if not self.map.in_bounds(nx, ny):
+                continue
+            if not self.map.is_walkable(nx, ny):
+                continue
+            d = self.map.door_at(nx, ny)
+            if d and not d.open:
+                # Closed door: allow if unlocked, or locked and we have a key
+                if d.locked and int(self.inventory.get("key", 0)) <= 0:
+                    continue
+            out.append((nx, ny))
         return out
 
     def _is_occupied(self, x: int, y: int) -> bool:
@@ -787,9 +1197,13 @@ class Game:
         return points[0]
 
     def _estimate_risk_should_flee(self) -> bool:
-        # Very simple: flee if HP < 40% or many enemies are adjacent/nearby with higher combined power.
+        # Flee if HP < 40% baseline; if Hexed, be more cautious (<=50%).
         if self.player.hp <= max(1, int(self.player.max_hp * 0.4)):
             return True
+        # Be more cautious when Hexed (reduced ATK)
+        if self._get_effect(self.player, "Hex") is not None:
+            if self.player.hp <= max(1, int(self.player.max_hp * 0.5)):
+                return True
         # Count enemies in radius 1 (Chebyshev 1)
         near_count = 0
         total_power = 0
@@ -820,6 +1234,22 @@ class Game:
             return ("wait", None, None, "idle")
         px, py = self.player.x, self.player.y
 
+        # Archer LOS avoidance helpers
+        def _archers_in_line_aiming() -> List[Entity]:
+            out: List[Entity] = []
+            for e in self._visible_enemies():
+                if (e.name or '').lower() == 'archer':
+                    if e.effects.get('Aim'):
+                        # Straight line LOS and range >=2
+                        if (e.x == px or e.y == py) and self.has_los(e.x, e.y, px, py, radius=12) and max(abs(e.x-px), abs(e.y-py)) >= 2:
+                            out.append(e)
+            return out
+        def _would_break_los(nx: int, ny: int, archers: List[Entity]) -> bool:
+            for a in archers:
+                if (a.x == nx or a.y == ny) and self.has_los(a.x, a.y, nx, ny, radius=12) and max(abs(a.x-nx), abs(a.y-ny)) >= 2:
+                    return False
+            return True
+
         # 1) Low HP: flee (no inventory system here)
         if self._estimate_risk_should_flee():
             # choose step that maximizes distance to nearest visible enemy
@@ -838,6 +1268,43 @@ class Game:
                     dx, dy = best[0] - px, best[1] - py
                     return ("move", (dx, dy), None, "flee (low HP)")
                 return ("wait", None, None, "hold (corner)")
+
+        # 1.2) If any archer is aiming at us, try to break LOS or close to melee
+        aiming = _archers_in_line_aiming()
+        if aiming:
+            # Try steps that break LOS; otherwise move to reduce distance to 1
+            best_step = None
+            for nx, ny in self._neighbors4(px, py) + [(px, py)]:
+                if (nx, ny) != (px, py) and self._is_occupied(nx, ny):
+                    continue
+                if _would_break_los(nx, ny, aiming) or any(abs(nx - a.x) + abs(ny - a.y) == 1 for a in aiming):
+                    best_step = (nx, ny)
+                    break
+            if best_step and best_step != (px, py):
+                dx, dy = best_step[0] - px, best_step[1] - py
+                try:
+                    self.run_shots_dodged += 1
+                except Exception:
+                    pass
+                return ("move", (dx, dy), None, "auto: avoid LOS")
+
+        # 1.3) Generally avoid standing in straight LOS with any visible archer if possible
+        vis_archers = [e for e in self._visible_enemies() if (e.name or '').lower() == 'archer']
+        if vis_archers:
+            def in_los_with_any(x: int, y: int) -> bool:
+                for a in vis_archers:
+                    if (a.x == x or a.y == y) and self.has_los(a.x, a.y, x, y, radius=12) and max(abs(a.x-x), abs(a.y-y)) >= 2:
+                        return True
+                return False
+            if in_los_with_any(px, py):
+                for nx, ny in self._neighbors4(px, py) + [(px, py)]:
+                    if (nx, ny) != (px, py) and self._is_occupied(nx, ny):
+                        continue
+                    if not in_los_with_any(nx, ny):
+                        if (nx, ny) != (px, py):
+                            dx, dy = nx - px, ny - py
+                            return ("move", (dx, dy), None, "auto: avoid LOS")
+                        break
 
         # 1.5) Exit visible and near (<=6): prioritize if healthy enough and no dangerous adjacent
         if self.exit_x is not None and self.exit_y is not None:
@@ -881,6 +1348,19 @@ class Game:
         # 3) Visible enemy: approach via BFS to enemy tile (allow attack on arrival)
         vis = self._visible_enemies()
         if vis:
+            # Prefer approach toward highest-priority role first
+            def _pri(name: str) -> int:
+                order = {"shaman": 0, "priest": 1, "archer": 2, "troll": 3, "goblin": 4}
+                return order.get(name.lower(), 9)
+            _sorted = sorted([e for e in vis], key=lambda e: (_pri(e.name), abs(e.x - px) + abs(e.y - py)))
+            if _sorted:
+                _t = _sorted[0]
+                _p = self._bfs_path((px, py), [(_t.x, _t.y)])
+                if _p and len(_p) >= 2:
+                    nx, ny = _p[1]
+                    dx, dy = nx - px, ny - py
+                    steps = len(_p) - 1
+                    return ("move", (dx, dy), _p[1:7], f"path → {_t.name} ({steps} steps)")
             # nearest by BFS distance approx (use Manhattan heuristic for pick)
             goals = [(e.x, e.y) for e in vis]
             path = self._bfs_path((px, py), goals)
@@ -935,6 +1415,11 @@ class Game:
                 self.logger.log("Auto: " + desc)
             elif desc.startswith("use potion"):
                 self.logger.log("Auto: use Potion")
+            elif desc.lower().startswith("auto:"):
+                try:
+                    self.logger.log("Auto: " + desc.split(":", 1)[1].strip())
+                except Exception:
+                    self.logger.log("Auto: action")
             self._auto_target_desc = desc
         # Save path preview
         self._auto_path = path or []
@@ -956,6 +1441,8 @@ class Game:
         if consumed:
             self.enemy_turns()
             self.turn += 1
+            # Player effects tick down each of your turns
+            self._decay_effects(self.player)
             if getattr(self, "_digest", None) is not None:
                 for line in self._digest.summarize():
                     self.logger.log(line)
@@ -974,6 +1461,74 @@ class Game:
                 self.logger.log("Auto: replan (no progress)")
         self.recompute_fov()
         return consumed
+
+    # ---------- Effects & Combat helpers ----------
+    def _get_effect(self, ent: Entity, name: str) -> Optional[Dict[str, Any]]:
+        return ent.effects.get(name)
+
+    def _set_effect(self, ent: Entity, name: str, dur: int, **params):
+        ent.effects[name] = {"dur": int(dur), **params}
+
+    def _remove_effect(self, ent: Entity, name: str):
+        if name in ent.effects:
+            del ent.effects[name]
+
+    def _decay_effects(self, ent: Entity):
+        to_del: List[str] = []
+        for k, v in ent.effects.items():
+            d = int(v.get("dur", 0))
+            d -= 1
+            v["dur"] = d
+            if d <= 0:
+                to_del.append(k)
+        for k in to_del:
+            del ent.effects[k]
+
+    def _atk_mod(self, ent: Entity) -> int:
+        mod = 0
+        f = ent.effects.get("Frenzy")
+        if f and int(f.get("dur", 0)) > 0:
+            mod += int(f.get("atk", 1))
+        h = ent.effects.get("Hex")
+        if h and int(h.get("dur", 0)) > 0:
+            mod -= abs(int(h.get("atk", 1)))
+        return mod
+
+    def _apply_shield(self, ent: Entity, amount: int, dur: int):
+        cur = ent.effects.get("Shield")
+        temp = int(cur.get("temp", 0)) if cur else 0
+        temp += int(amount)
+        self._set_effect(ent, "Shield", dur, temp=temp)
+
+    def _apply_frenzy(self, ent: Entity, atk_bonus: int = 1, dur: int = 3):
+        self._set_effect(ent, "Frenzy", dur, atk=atk_bonus)
+
+    def _apply_hex(self, ent: Entity, atk_penalty: int = 1, dur: int = 3):
+        self._set_effect(ent, "Hex", dur, atk=atk_penalty)
+        if ent is self.player:
+            try:
+                self.run_times_hexed += 1
+            except Exception:
+                pass
+
+    def _compute_damage(self, attacker: Entity, defender: Entity) -> int:
+        base = max(0, int(attacker.power) + int(self._atk_mod(attacker)))
+        mult = 1.0
+        aim = attacker.effects.get("Aim")
+        if aim and int(aim.get("dur", 0)) > 0:
+            mult *= float(aim.get("mul", 2.0))
+        dmg = int(max(0, round(base * mult)))
+        # Shield absorption
+        sh = defender.effects.get("Shield")
+        if sh and int(sh.get("dur", 0)) > 0:
+            temp = int(sh.get("temp", 0))
+            if temp > 0:
+                absorbed = min(dmg, temp)
+                sh["temp"] = temp - absorbed
+                dmg -= absorbed
+                if hasattr(self, "_digest") and self._digest is not None:
+                    self._digest.record_effect("Shield")
+        return max(0, int(dmg))
 
     def read_key_nonblocking(self, allowed: Optional[set] = None) -> Optional[str]:
         if not msvcrt.kbhit():
@@ -1072,7 +1627,9 @@ class Game:
         # Build right pane content (fixed width): status, controls, visible enemies; bottom: folded log
         pane_top_max = max(0, h - HUD_LOG_LINES)
         if self.state in ("playing", "paused", "game_over", "victory"):
-            status_line = f"HP {self.player.hp}/{self.player.max_hp}  ATK {self.player.power}  Turn {self.turn}  Seed {self.seed}"
+            tier = getattr(self, 'menu_tier', 1)
+            gen = 'rooms' if getattr(self.map, 'gen_type', 'caves') == 'rooms' else 'caves'
+            status_line = f"HP {self.player.hp}/{self.player.max_hp}  ATK {self.player.power}  Turn {self.turn}  Tier {tier}  Gen {gen}  Seed {self.seed}"
         else:
             seed_str = (str(self.menu_seed_value) if not self.menu_seed_random else "random")
             status_line = f"HP -/-  ATK -  Turn -  Seed {seed_str}"
@@ -1091,6 +1648,21 @@ class Game:
             il = self._inventory_line()
             if il:
                 pane_top_lines.extend(self._wrap(il, pane_w))
+        except Exception:
+            pass
+        # Effects line for player
+        try:
+            effs = []
+            for name, data in self.player.effects.items():
+                d = int(data.get('dur', 0))
+                if name == 'Shield':
+                    effs.append(f"Shield ({d})")
+                elif name == 'Hex':
+                    effs.append(f"Hex ({d})")
+                elif name == 'Frenzy':
+                    effs.append(f"Frenzy ({d})")
+            if effs:
+                pane_top_lines.extend(self._wrap("Effects: " + ", ".join(effs), pane_w))
         except Exception:
             pass
         try:
@@ -1142,6 +1714,15 @@ class Game:
                 else:
                     base_ch = WALL_CHAR
                     base_col = FG_GRAY
+                # Door overlay
+                d = self.map.door_at(x, y)
+                if d and (explored or visible):
+                    if d.open:
+                        base_ch = "/"
+                        base_col = FG_YELLOW if visible else FG_GRAY
+                    else:
+                        base_ch = "+" if not d.locked else "*"
+                        base_col = FG_YELLOW if visible else FG_GRAY
                 # Exit overlay on floor
                 if (self.exit_x is not None and self.exit_y is not None and x == self.exit_x and y == self.exit_y and (explored or visible)):
                     base_ch = ">"
@@ -1163,7 +1744,7 @@ class Game:
                             it_here = it
                             break
                     if it_here is not None:
-                        item_ch = "!" if it_here.kind == "potion" else ","
+                        item_ch = "!" if it_here.kind == "potion" else ("k" if it_here.kind == "key" else ",")
                         if use_color:
                             row_chars.append(FG_CYAN + item_ch + RESET)
                         else:
@@ -1216,10 +1797,17 @@ class Game:
     def _inventory_line(self) -> str:
         try:
             pot = int(self.inventory.get("potion", 0))
+            keys = int(self.inventory.get("key", 0))
         except Exception:
             pot = 0
+            keys = 0
+        parts: List[str] = []
         if pot > 0:
-            return f"Items: ! Potion x{pot}"
+            parts.append(f"! Potion x{pot}")
+        if keys > 0:
+            parts.append(f"k Key x{keys}")
+        if parts:
+            return "Items: " + ", ".join(parts)
         return ""
 
     def render_frame(self, frame: str):
@@ -1252,6 +1840,8 @@ class Game:
             "state": self.state,
             "turn": self.turn,
             "seed": self.seed,
+            "tier": int(getattr(self, "menu_tier", 1)),
+            "gen_type": getattr(self.map, "gen_type", "caves"),
             "map": self.map.serialize(),
             "player": self.player.serialize(),
             "enemies": [e.serialize() for e in self.enemies if e.is_alive()],
@@ -1264,6 +1854,9 @@ class Game:
                 "dmg_dealt": self.run_dmg_dealt,
                 "dmg_taken": self.run_dmg_taken,
                 "items_used": self.run_items_used,
+                "kills_by_role": dict(self.run_kills_by_role),
+                "times_hexed": int(self.run_times_hexed),
+                "shots_dodged": int(self.run_shots_dodged),
             },
         }
         try:
@@ -1288,6 +1881,7 @@ class Game:
         self.turn = data.get("turn", 1)
         self.seed = data.get("seed", 1337)
         self.rng = random.Random(self.seed)
+        self.menu_tier = int(data.get("tier", 1))
         self.map = Map.deserialize(data["map"]) if "map" in data else self.map
         self.player = Entity.deserialize(data["player"], FG_BRIGHT_WHITE, FG_BRIGHT_WHITE)
         loaded_enemies: List[Entity] = []
@@ -1305,12 +1899,18 @@ class Game:
         else:
             self.exit_x, self.exit_y = None, None
         self.items = [Item.deserialize(it) for it in data.get("items", [])]
-        self.inventory = dict(data.get("inventory", {"potion": 0}))
+        inv = data.get("inventory", {"potion": 0})
+        if "key" not in inv:
+            inv["key"] = 0
+        self.inventory = dict(inv)
         st = data.get("stats", {})
         self.run_kills = int(st.get("kills", 0))
         self.run_dmg_dealt = int(st.get("dmg_dealt", 0))
         self.run_dmg_taken = int(st.get("dmg_taken", 0))
         self.run_items_used = int(st.get("items_used", 0))
+        self.run_kills_by_role = dict(st.get("kills_by_role", {}))
+        self.run_times_hexed = int(st.get("times_hexed", 0))
+        self.run_shots_dodged = int(st.get("shots_dodged", 0))
         self.logger.log("Loaded.")
         self.recompute_fov()
         return True
@@ -1340,10 +1940,11 @@ class Game:
                     if key == "ESC":
                         break
                     if key in ("UP", "DOWN", "TAB"):
+                        total = 6
                         if key == "UP":
-                            self.menu_sel = (self.menu_sel - 1) % 4
+                            self.menu_sel = (self.menu_sel - 1) % total
                         else:
-                            self.menu_sel = (self.menu_sel + 1) % 4
+                            self.menu_sel = (self.menu_sel + 1) % total
                     elif key in ("LEFT", "RIGHT", "+", "-"):
                         inc = 1 if key in ("RIGHT", "+") else -1
                         if self.menu_sel == 0:
@@ -1371,6 +1972,12 @@ class Game:
                             self.menu_height = max(10, min(60, self.menu_height + inc))
                         elif self.menu_sel == 3:
                             self.menu_enemies = max(0, min(99, self.menu_enemies + inc))
+                        elif self.menu_sel == 4:
+                            self.menu_tier = max(1, min(3, int(getattr(self, 'menu_tier', 1)) + inc))
+                        elif self.menu_sel == 5:
+                            # toggle generator
+                            if inc != 0:
+                                self.menu_use_rooms = not bool(getattr(self, 'menu_use_rooms', True))
                     elif key == "ENTER":
                         self.new_game(is_restart=False)
                     # redraw menu every interaction
@@ -1692,6 +2299,8 @@ def build_menu_frame(self) -> str:
             ("Width", str(self.menu_width)),
             ("Height", str(self.menu_height)),
             ("Enemies", str(self.menu_enemies)),
+            ("Tier", str(getattr(self, 'menu_tier', 1))),
+            ("Generator", ("rooms" if getattr(self, 'menu_use_rooms', True) else "caves")),
         ]
         header = [
             "Rogue-like: Text Crawler",
@@ -1734,7 +2343,15 @@ def visible_enemies_list(self: "Game") -> List[str]:
     vis.sort(key=lambda t: t[0])
     for dist, e in vis:
         dir_s = _dir_to_compass(e.x - px, e.y - py)
-        out.append(f"{e.ch} {e.name}  {e.hp}/{e.max_hp}  dist {dist}  {dir_s}")
+        tags: List[str] = []
+        if e.effects.get("Shield"):
+            tags.append("Shield")
+        if e.effects.get("Frenzy"):
+            tags.append("Frenzy")
+        if (e.name or '').lower() == 'archer' and e.effects.get("Aim"):
+            tags.append("Aim")
+        tag_str = (" [" + ", ".join(tags) + "]") if tags else ""
+        out.append(f"{e.ch} {e.name}  {e.hp}/{e.max_hp}  dist {dist}  {dir_s}{tag_str}")
     return out
 
 def _dir_to_compass(dx: int, dy: int) -> str:
@@ -1769,6 +2386,15 @@ def build_help_frame(self: "Game") -> str:
     pane_lines: List[str] = []
     for s in legend:
         pane_lines.extend(self._wrap(s, pane_w))
+    # Extra: doors and abilities summary
+    extra = [
+        "",
+        "Doors: '+' closed, '*' locked (need Key), '/' open",
+        "Abilities: Archer Aim/Shot; Priest Shield; Troll Regen; Shaman Frenzy/Hex",
+        "Bot: avoids Archer LOS; opens doors; uses keys",
+    ]
+    for s in extra:
+        pane_lines.extend(self._wrap(s, pane_w))
     pane_lines = (pane_lines + [""] * h)[:h]
     blank_left = " " * w
     for y in range(h):
@@ -1790,12 +2416,26 @@ def _inspect_info_lines(self: "Game") -> List[str]:
             tile_name = "unknown"
         else:
             tile_name = "floor" if tile.walkable else "wall"
+            d = self.map.door_at(x, y)
+            if d:
+                tile_name = f"door ({'open' if d.open else ('locked' if d.locked else 'closed')})"
     lines.append(f"Tile: {tile_name} @ {x},{y}")
     ent = self.entity_at(x, y)
     if ent is not None:
         who = "You (@)" if ent is self.player else f"{ent.name} ({ent.ch})"
         lines.append(f"Unit: {who}")
         lines.append(f"HP {ent.hp}/{ent.max_hp}  ATK {ent.power}")
+        if getattr(ent, 'effects', None):
+            for name, data in ent.effects.items():
+                d = int(data.get('dur', 0))
+                if name == 'Shield':
+                    lines.append(f"Effect: Shield ({d}) temp {int(data.get('temp', 0))}")
+                elif name == 'Hex':
+                    lines.append(f"Effect: Hex ({d})")
+                elif name == 'Frenzy':
+                    lines.append(f"Effect: Frenzy (+ATK) ({d})")
+                elif name == 'Aim':
+                    lines.append(f"Effect: Aim ({d})")
     px, py = self.player.x, self.player.y
     dist = max(abs(x - px), abs(y - py))
     los = "yes" if self.has_los(px, py, x, y, FOV_RADIUS) else "no"

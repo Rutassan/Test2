@@ -53,6 +53,8 @@ class NewGameDialog(tk.Toplevel):
         self.var_w = tk.IntVar(value=game.menu_width)
         self.var_h = tk.IntVar(value=game.menu_height)
         self.var_enemies = tk.IntVar(value=game.menu_enemies)
+        self.var_tier = tk.IntVar(value=getattr(game, 'menu_tier', 1))
+        self.var_rooms = tk.BooleanVar(value=getattr(game, 'menu_use_rooms', True))
 
         ttk.Label(frm, text="Seed:").grid(row=0, column=0, sticky="w")
         se = ttk.Entry(frm, textvariable=self.var_seed, width=12)
@@ -67,9 +69,13 @@ class NewGameDialog(tk.Toplevel):
         ttk.Entry(frm, textvariable=self.var_h, width=8).grid(row=2, column=1, sticky="w")
         ttk.Label(frm, text="Enemies:").grid(row=3, column=0, sticky="w")
         ttk.Entry(frm, textvariable=self.var_enemies, width=8).grid(row=3, column=1, sticky="w")
+        ttk.Label(frm, text="Tier:").grid(row=4, column=0, sticky="w")
+        tier_box = ttk.Combobox(frm, state="readonly", values=(1,2,3), width=6, textvariable=self.var_tier)
+        tier_box.grid(row=4, column=1, sticky="w")
+        ttk.Checkbutton(frm, text="Use rooms/corridors", variable=self.var_rooms).grid(row=5, column=0, columnspan=2, sticky="w")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=4, column=0, columnspan=3, pady=(10, 0), sticky="e")
+        btns.grid(row=6, column=0, columnspan=3, pady=(10, 0), sticky="e")
         ttk.Button(btns, text="OK", command=self.on_ok).grid(row=0, column=0, padx=5)
         ttk.Button(btns, text="Cancel", command=self.on_cancel).grid(row=0, column=1)
 
@@ -101,6 +107,11 @@ class NewGameDialog(tk.Toplevel):
         self.game.menu_width = w
         self.game.menu_height = h
         self.game.menu_enemies = en
+        try:
+            self.game.menu_tier = int(self.var_tier.get())
+        except Exception:
+            self.game.menu_tier = 1
+        self.game.menu_use_rooms = bool(self.var_rooms.get())
         self.result = True
         self.destroy()
 
@@ -114,7 +125,7 @@ class SeriesDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Auto Series")
         self.resizable(False, False)
-        self.result: Optional[Tuple[int, bool, int]] = None
+        self.result: Optional[Tuple[int, bool, int, int, bool]] = None
         frm = ttk.Frame(self, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
         ttk.Label(frm, text="Runs:").grid(row=0, column=0, sticky="w")
@@ -125,8 +136,13 @@ class SeriesDialog(tk.Toplevel):
         ttk.Label(frm, text="Show frames every K ticks (0=hidden):").grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.var_show = tk.IntVar(value=0)
         ttk.Entry(frm, textvariable=self.var_show, width=10).grid(row=3, column=0, sticky="w")
+        ttk.Label(frm, text="Tier:").grid(row=3, column=1, sticky="w")
+        self.var_tier = tk.IntVar(value=1)
+        ttk.Combobox(frm, state="readonly", values=(1,2,3), width=6, textvariable=self.var_tier).grid(row=3, column=1, sticky="e")
+        self.var_rooms = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm, text="Use rooms/corridors", variable=self.var_rooms).grid(row=4, column=0, columnspan=2, sticky="w")
         btns = ttk.Frame(frm)
-        btns.grid(row=4, column=0, columnspan=2, pady=(10, 0), sticky="e")
+        btns.grid(row=5, column=0, columnspan=2, pady=(10, 0), sticky="e")
         ttk.Button(btns, text="Start", command=self.on_start).grid(row=0, column=0, padx=5)
         ttk.Button(btns, text="Cancel", command=self.on_cancel).grid(row=0, column=1)
         self.bind("<Return>", lambda e: self.on_start())
@@ -141,10 +157,12 @@ class SeriesDialog(tk.Toplevel):
             runs = max(1, int(self.var_runs.get()))
             fixed = bool(self.var_fixed.get())
             show = max(0, int(self.var_show.get()))
+            tier = int(self.var_tier.get())
+            use_rooms = bool(self.var_rooms.get())
         except Exception:
             messagebox.showerror("Invalid", "Please enter valid integers")
             return
-        self.result = (runs, fixed, show)
+        self.result = (runs, fixed, show, tier, use_rooms)
         self.destroy()
 
     def on_cancel(self):
@@ -272,10 +290,16 @@ class GuiApp:
         self._series_sum_dmg_taken: int = 0
         self._series_sum_dmg_dealt: int = 0
         self._series_sum_items_used: int = 0
+        # Extra series metrics
+        self._series_sum_times_hexed: int = 0
+        self._series_sum_shots_dodged: int = 0
+        self._series_kills_by_role: dict = {}
         self._series_fixed_seed: bool = False
         self._series_base_seed: int = 1337
         self._series_show_every: int = 0
         self._series_report_lines: Optional[List[str]] = None
+        self._series_tier: int = 1
+        self._series_use_rooms: bool = True
         # Modal/dialog guard
         self._modal_open: bool = False
 
@@ -541,6 +565,11 @@ class GuiApp:
             # Enemies move and digest log
             g.enemy_turns()
             g.turn += 1
+            # Tick player effects after turn
+            try:
+                g._decay_effects(g.player)
+            except Exception:
+                pass
             if getattr(g, "_digest", None) is not None:
                 for line in g._digest.summarize():
                     g.logger.log(line)
@@ -629,6 +658,26 @@ class GuiApp:
                     fill = "#b0b0b0" if visible else "#404040"  # walls
                 self.canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline="")
 
+        # Doors overlay
+        try:
+            for (dx, dy), d in getattr(g.map, 'doors', {}).items():
+                if not g.map.explored[dy][dx]:
+                    continue
+                x0 = ox + dx * tile
+                y0 = oy + dy * tile
+                # Draw a vertical bar for door
+                color = "#ffd700" if (g.visible[dy][dx]) else "#808080"
+                if d.open:
+                    # Slightly open: two small lines
+                    self.canvas.create_line(x0 + tile*0.3, y0 + tile*0.2, x0 + tile*0.7, y0 + tile*0.2, fill=color, width=2)
+                    self.canvas.create_line(x0 + tile*0.3, y0 + tile*0.8, x0 + tile*0.7, y0 + tile*0.8, fill=color, width=2)
+                else:
+                    self.canvas.create_rectangle(x0 + tile*0.4, y0 + tile*0.2, x0 + tile*0.6, y0 + tile*0.8, outline=color, width=2)
+                    if d.locked:
+                        self.canvas.create_oval(x0 + tile*0.47, y0 + tile*0.45, x0 + tile*0.53, y0 + tile*0.55, fill=color, outline=color)
+        except Exception:
+            pass
+
         # Draw Exit portal tile (glow)
         ex, ey = getattr(g, 'exit_x', None), getattr(g, 'exit_y', None)
         if isinstance(ex, int) and isinstance(ey, int):
@@ -653,9 +702,16 @@ class GuiApp:
                 if 0 <= it.x < map_cols and 0 <= it.y < map_rows and g.visible[it.y][it.x]:
                     x0 = ox + it.x * tile
                     y0 = oy + it.y * tile
-                    # Small bottle icon
-                    self.canvas.create_rectangle(x0 + tile*0.35, y0 + tile*0.25, x0 + tile*0.65, y0 + tile*0.65, fill="#40c0ff", outline="#a0e0ff")
-                    self.canvas.create_rectangle(x0 + tile*0.45, y0 + tile*0.15, x0 + tile*0.55, y0 + tile*0.25, fill="#a0e0ff", outline="")
+                    kind = getattr(it, 'kind', 'potion')
+                    if kind == 'potion':
+                        # Small bottle icon
+                        self.canvas.create_rectangle(x0 + tile*0.35, y0 + tile*0.25, x0 + tile*0.65, y0 + tile*0.65, fill="#40c0ff", outline="#a0e0ff")
+                        self.canvas.create_rectangle(x0 + tile*0.45, y0 + tile*0.15, x0 + tile*0.55, y0 + tile*0.25, fill="#a0e0ff", outline="")
+                    else:
+                        # Key icon
+                        pad = max(2, tile // 8)
+                        self.canvas.create_oval(x0 + pad, y0 + pad, x0 + tile//2, y0 + tile//2, fill="#ffd700", outline="#e0b000")
+                        self.canvas.create_rectangle(x0 + tile*0.55, y0 + tile*0.40, x0 + tile*0.80, y0 + tile*0.50, fill="#ffd700", outline="#e0b000")
         except Exception:
             pass
 
@@ -722,7 +778,8 @@ class GuiApp:
         pane_y0 = oy
         # Status
         if g.state in ("playing", "paused", "game_over", "victory"):
-            status_line = f"HP {g.player.hp}/{g.player.max_hp}  ATK {g.player.power}  Turn {g.turn}  Seed {g.seed}"
+            gen = 'rooms' if getattr(g.map, 'gen_type', 'caves') == 'rooms' else 'caves'
+            status_line = f"HP {g.player.hp}/{g.player.max_hp}  ATK {g.player.power}  Turn {g.turn}  Tier {getattr(g, 'menu_tier', 1)}  Gen {gen}  Seed {g.seed}"
         else:
             seed_str = (str(g.menu_seed_value) if not g.menu_seed_random else "random")
             status_line = f"HP -/-  ATK -  Turn -  Seed {seed_str}"
@@ -745,6 +802,23 @@ class GuiApp:
             pane_lines.append(goal_line)
         if inv_line:
             pane_lines.append(inv_line)
+        # Player Effects line
+        try:
+            effs = []
+            for name, data in getattr(g.player, 'effects', {}).items():
+                d = int(data.get('dur', 0))
+                if name == 'Shield':
+                    effs.append(f"Shield ({d})")
+                elif name == 'Hex':
+                    effs.append(f"Hex ({d})")
+                elif name == 'Frenzy':
+                    effs.append(f"Frenzy ({d})")
+                elif name == 'Aim':
+                    effs.append(f"Aim ({d})")
+            if effs:
+                pane_lines.append("Effects: " + ", ".join(effs))
+        except Exception:
+            pass
         pane_lines.append(ar_line)
         if g.state in ("playing", "paused", "game_over"):
             if g.inspect_mode:
@@ -876,6 +950,16 @@ class GuiApp:
         lines.extend(g._wrap("A — toggle, [ / ] — speed, } — fast, P — pause", panel_chars))
         lines.append("")
         lines.extend(g._wrap("H/Esc — close", panel_chars))
+        # Extra: doors and abilities
+        lines.append("")
+        lines.extend(g._wrap("Doors: '+' closed, '*' locked (need Key), '/' open", panel_chars))
+        lines.extend(g._wrap("Abilities:", panel_chars))
+        lines.extend(g._wrap("Archer: Aim then Shot (2-5 tiles, +100% next shot)", panel_chars))
+        lines.extend(g._wrap("Priest: Shield (+temp HP, 3 turns)", panel_chars))
+        lines.extend(g._wrap("Troll: Regen (+1 HP/turn; Tier 3: +2)", panel_chars))
+        lines.extend(g._wrap("Shaman: Frenzy ally (+1 ATK, 3) or Hex player (-1 ATK, 3)", panel_chars))
+        lines.append("")
+        lines.extend(g._wrap("Bot: avoids Archer LOS; opens doors; uses keys", panel_chars))
         # Measure and draw panel
         text_w = panel_chars * max(1, ch_w)
         text_h = len(lines) * max(1, ch_h)
@@ -981,10 +1065,10 @@ class GuiApp:
         self.root.wait_window(dlg)
         if not dlg.result:
             return
-        runs, fixed, show_every = dlg.result
-        self.start_series(runs, fixed, show_every)
+        runs, fixed, show_every, tier, use_rooms = dlg.result
+        self.start_series(runs, fixed, show_every, tier=tier, use_rooms=use_rooms)
 
-    def start_series(self, runs: int, fixed_seed: bool, show_every: int):
+    def start_series(self, runs: int, fixed_seed: bool, show_every: int, tier: int = 1, use_rooms: bool = True):
         # Initialize counters
         self._series_active = True
         self._series_total = max(1, int(runs))
@@ -999,6 +1083,8 @@ class GuiApp:
         self._series_fixed_seed = bool(fixed_seed)
         self._series_show_every = max(0, int(show_every))
         self._series_base_seed = int(self.game.menu_seed_value if not self.game.menu_seed_random else int(time.time() * 1000))
+        self._series_tier = int(tier)
+        self._series_use_rooms = bool(use_rooms)
         # Configure game
         self.game.auto_play = True
         try:
@@ -1029,6 +1115,9 @@ class GuiApp:
         else:
             self.game.menu_seed_random = True
             self.game.menu_seed_value = -1
+        # Apply series-tier and generator
+        self.game.menu_tier = int(getattr(self, '_series_tier', 1))
+        self.game.menu_use_rooms = bool(getattr(self, '_series_use_rooms', True))
         self.game.new_game(is_restart=False)
         self.game._series_mode = True
         self._series_done += 1
@@ -1050,7 +1139,17 @@ class GuiApp:
             f"Avg Damage Taken: {self._series_sum_dmg_taken / N:.1f}",
             f"Avg Damage Dealt: {self._series_sum_dmg_dealt / N:.1f}",
             f"Avg Items Used: {self._series_sum_items_used / N:.2f}",
+            f"Tier: {getattr(self, '_series_tier', 1)}",
         ]
+        # Extra metrics
+        try:
+            lines.append(f"Times Hexed: {int(self._series_sum_times_hexed)}")
+            lines.append(f"Shots dodged (Aim): {int(self._series_sum_shots_dodged)}")
+            if self._series_kills_by_role:
+                parts = [f"{k} {v}" for k, v in self._series_kills_by_role.items()]
+                lines.append("Kills by role: " + ", ".join(parts))
+        except Exception:
+            pass
         self._series_report_lines = lines
         SeriesResultsDialog(self.root, lines)
         self.redraw()
@@ -1201,6 +1300,15 @@ class GuiApp:
                 self._series_sum_dmg_taken += int(g.run_dmg_taken)
                 self._series_sum_dmg_dealt += int(g.run_dmg_dealt)
                 self._series_sum_items_used += int(g.run_items_used)
+                # Extra metrics from run
+                try:
+                    self._series_sum_times_hexed += int(getattr(g, 'run_times_hexed', 0))
+                    self._series_sum_shots_dodged += int(getattr(g, 'run_shots_dodged', 0))
+                    kb = dict(getattr(g, 'run_kills_by_role', {}) or {})
+                    for k, v in kb.items():
+                        self._series_kills_by_role[k] = self._series_kills_by_role.get(k, 0) + int(v)
+                except Exception:
+                    pass
                 # Next run after short delay
                 self.root.after(max(1, int(g.auto_restart_delay_ms)), self._series_next_run)
             elif (g.state in ("victory", "game_over")):
