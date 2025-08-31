@@ -808,6 +808,11 @@ class GuiApp:
         auto_on = "ON" if g.auto_play else "OFF"
         fast_suffix = f"  Fast: {'ON' if g.auto_fast else 'OFF'}"
         auto_line = f"AUTO: {auto_on}  Speed: {auto_speed} tps{fast_suffix}  (A toggle, [ ] speed, }} fast)"
+        auto_diag = ""
+        try:
+            auto_diag = g._auto_hud_line()
+        except Exception:
+            auto_diag = ""
         goal_line = ""
         inv_line = ""
         try:
@@ -831,6 +836,8 @@ class GuiApp:
                 pane_lines.append(live_line)
         except Exception:
             pane_lines: List[str] = [status_line, controls_line, auto_line]
+            if auto_diag:
+                pane_lines.append(auto_diag)
         if goal_line:
             pane_lines.append(goal_line)
         if inv_line:
@@ -1466,51 +1473,53 @@ class GuiApp:
     def _auto_tick(self):
         self._auto_after_id = None
         g = self.game
-        if not g.auto_play:
-            return
-        # Pause auto when modal overlays are open
-        if g.help_mode or g.inspect_mode:
-            self.redraw()
+        try:
+            if not g.auto_play:
+                return
+            # Pause auto when modal overlays are open
+            if g.help_mode or g.inspect_mode:
+                self.redraw()
+                return
+            # Perform one tick only if playing
+            if g.state == "playing":
+                g.auto_tick()
+                self._auto_counter += 1
+            else:
+                # End of run handling for series
+                if self._series_active and g.state in ("victory", "game_over"):
+                    if g.state == "victory":
+                        self._series_wins += 1
+                    else:
+                        self._series_losses += 1
+                    self._series_sum_turns += int(g.turn)
+                    self._series_sum_kills += int(g.run_kills)
+                    self._series_sum_dmg_taken += int(g.run_dmg_taken)
+                    self._series_sum_dmg_dealt += int(g.run_dmg_dealt)
+                    self._series_sum_items_used += int(g.run_items_used)
+                    # Extra metrics from run
+                    try:
+                        self._series_sum_times_hexed += int(getattr(g, 'run_times_hexed', 0))
+                        self._series_sum_shots_dodged += int(getattr(g, 'run_shots_dodged', 0))
+                        kb = dict(getattr(g, 'run_kills_by_role', {}) or {})
+                        for k, v in kb.items():
+                            self._series_kills_by_role[k] = self._series_kills_by_role.get(k, 0) + int(v)
+                    except Exception:
+                        pass
+                    # Next run after short delay
+                    self.root.after(max(1, int(g.auto_restart_delay_ms)), self._series_next_run)
+                elif (g.state in ("victory", "game_over")):
+                    should = (g.state == "victory" and g.auto_restart_on_victory) or (g.state == "game_over" and g.auto_restart_on_death)
+                    if should:
+                        self.root.after(max(1, int(g.auto_restart_delay_ms)), lambda: (g.new_game(is_restart=True), self.redraw()))
+            # Redraw per fast mode (skip if hidden during series)
+            should_draw = (not g.auto_fast) or (self._auto_counter % max(1, g.auto_render_every_n_ticks) == 0)
+            if self._series_active and self._series_show_every == 0:
+                should_draw = False
+            if should_draw:
+                self.redraw()
+        finally:
+            # Always schedule next tick
             self._ensure_auto()
-            return
-        # Perform one tick only if playing
-        if g.state == "playing":
-            g.auto_tick()
-            self._auto_counter += 1
-        else:
-            # End of run handling for series
-            if self._series_active and g.state in ("victory", "game_over"):
-                if g.state == "victory":
-                    self._series_wins += 1
-                else:
-                    self._series_losses += 1
-                self._series_sum_turns += int(g.turn)
-                self._series_sum_kills += int(g.run_kills)
-                self._series_sum_dmg_taken += int(g.run_dmg_taken)
-                self._series_sum_dmg_dealt += int(g.run_dmg_dealt)
-                self._series_sum_items_used += int(g.run_items_used)
-                # Extra metrics from run
-                try:
-                    self._series_sum_times_hexed += int(getattr(g, 'run_times_hexed', 0))
-                    self._series_sum_shots_dodged += int(getattr(g, 'run_shots_dodged', 0))
-                    kb = dict(getattr(g, 'run_kills_by_role', {}) or {})
-                    for k, v in kb.items():
-                        self._series_kills_by_role[k] = self._series_kills_by_role.get(k, 0) + int(v)
-                except Exception:
-                    pass
-                # Next run after short delay
-                self.root.after(max(1, int(g.auto_restart_delay_ms)), self._series_next_run)
-            elif (g.state in ("victory", "game_over")):
-                should = (g.state == "victory" and g.auto_restart_on_victory) or (g.state == "game_over" and g.auto_restart_on_death)
-                if should:
-                    self.root.after(max(1, int(g.auto_restart_delay_ms)), lambda: (g.new_game(is_restart=True), self.redraw()))
-        # Redraw per fast mode (skip if hidden during series)
-        should_draw = (not g.auto_fast) or (self._auto_counter % max(1, g.auto_render_every_n_ticks) == 0)
-        if self._series_active and self._series_show_every == 0:
-            should_draw = False
-        if should_draw:
-            self.redraw()
-        self._ensure_auto()
 
     # ---------- Mouse handlers ----------
     def on_click(self, event: tk.Event):

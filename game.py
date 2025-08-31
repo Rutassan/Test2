@@ -488,6 +488,9 @@ class Game:
         self._auto_no_progress_ticks: int = 0
         self._auto_target_desc: Optional[str] = None
         self._auto_path: Optional[List[Tuple[int, int]]] = None  # full path including next cells
+        # Auto diagnostics / anti-stuck
+        self._auto_wait_streak: int = 0
+        self._auto_reason: Optional[str] = None
         # Optional behaviors
         self.auto_restart_on_death: bool = True
         self.auto_restart_on_victory: bool = True
@@ -995,26 +998,54 @@ class Game:
 
             # Default movement if no action taken
             if not acted:
-                if self.has_los(ex, ey, px, py, radius=12):
+                sees = self.has_los(ex, ey, px, py, radius=12)
+                # Memory for LOS
+                if sees:
+                    setattr(e, "_no_los_ticks", 0)
+                    setattr(e, "_last_seen_player", (px, py))
+                else:
+                    setattr(e, "_no_los_ticks", int(getattr(e, "_no_los_ticks", 0)) + 1)
+                if sees:
                     dx = 0 if ex == px else (1 if px > ex else -1)
                     dy = 0 if ey == py else (1 if py > ey else -1)
                     if abs(px - ex) >= abs(py - ey):
-                        if not self.is_blocked(ex + dx, ey):
-                            e.x += dx
-                        elif not self.is_blocked(ex, ey + dy):
-                            e.y += dy
+                        self.move_entity(e, dx, 0, attack_on_block=False)
+                        if (e.x, e.y) == (ex, ey):
+                            self.move_entity(e, 0, dy, attack_on_block=False)
                     else:
-                        if not self.is_blocked(ex, ey + dy):
-                            e.y += dy
-                        elif not self.is_blocked(ex + dx, ey):
-                            e.x += dx
+                        self.move_entity(e, 0, dy, attack_on_block=False)
+                        if (e.x, e.y) == (ex, ey):
+                            self.move_entity(e, dx, 0, attack_on_block=False)
                 else:
-                    if self.rng.random() < 0.3:
-                        dirs = [(1, 0), (-1, 0), (0, 1), (0, -1), (0, 0)]
-                        dx, dy = self.rng.choice(dirs)
-                        if not self.is_blocked(ex + dx, ey + dy):
-                            e.x += dx
-                            e.y += dy
+                    name_lc = (e.name or "").lower()
+                    nl = int(getattr(e, "_no_los_ticks", 0))
+                    did = False
+                    if name_lc == "archer":
+                        lsp = getattr(e, "_last_seen_player", None)
+                        if lsp is not None:
+                            tx, ty = lsp
+                            if abs(tx - ex) + abs(ty - ey) > 1:
+                                sdx = 0 if ex == tx else (1 if tx > ex else -1)
+                                sdy = 0 if ey == ty else (1 if ty > ey else -1)
+                                if abs(tx - ex) >= abs(ty - ey):
+                                    self.move_entity(e, sdx, 0, attack_on_block=False)
+                                    if (e.x, e.y) == (ex, ey):
+                                        self.move_entity(e, 0, sdy, attack_on_block=False)
+                                else:
+                                    self.move_entity(e, 0, sdy, attack_on_block=False)
+                                    if (e.x, e.y) == (ex, ey):
+                                        self.move_entity(e, sdx, 0, attack_on_block=False)
+                                did = (e.x, e.y) != (ex, ey)
+                    should_wander = (nl >= 3)
+                    if name_lc in ("shaman", "priest"):
+                        should_wander = should_wander and (nl % 2 == 0)
+                    if (not did) and should_wander:
+                        dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                        self.rng.shuffle(dirs)
+                        for dx, dy in dirs:
+                            if not self.is_blocked(ex + dx, ey + dy):
+                                self.move_entity(e, dx, dy, attack_on_block=False)
+                                break
 
             # End-of-turn effects for this enemy
             if name_l == "troll" and e.is_alive():
@@ -1141,18 +1172,31 @@ class Game:
         return False
 
     def _bfs_path(self, start: Tuple[int, int], goals: List[Tuple[int, int]]) -> Optional[List[Tuple[int, int]]]:
-        """BFS on walkable cells avoiding occupied tiles, except allowing entering the goal tile.
+        """Pathfinding with soft occupancy and door semantics.
+        - Open doors passable.
+        - Closed unlocked doors passable only if next step from start.
+        - Locked doors blocked unless we have a Key.
+        - Enemy-occupied tiles allowed but cost +2 (soft).
         Returns full path list from start to goal inclusive; None if unreachable.
         """
         if not goals:
             return None
-        W, H = self.map.w, self.map.h
+        import heapq
         goal_set = set(goals)
-        from collections import deque
-        q = deque([start])
+
+        def soft_cost(x: int, y: int) -> int:
+            for e in self.enemies:
+                if e.is_alive() and (e.x, e.y) == (x, y):
+                    return 3
+            return 1
+
+        pq: List[Tuple[int, Tuple[int, int]]] = [(0, start)]
         came: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
-        while q:
-            cur = q.popleft()
+        dist: Dict[Tuple[int, int], int] = {start: 0}
+        while pq:
+            cur_cost, cur = heapq.heappop(pq)
+            if cur_cost != dist.get(cur, 10**9):
+                continue
             if cur in goal_set:
                 # reconstruct
                 path: List[Tuple[int, int]] = []
@@ -1164,14 +1208,21 @@ class Game:
                 return path
             cx, cy = cur
             for nx, ny in self._neighbors4(cx, cy):
+                if not self.map.is_walkable(nx, ny):
+                    continue
+                d = self.map.door_at(nx, ny)
+                if d:
+                    if d.locked and int(self.inventory.get("key", 0)) <= 0:
+                        continue
+                    if not d.open and (cx, cy) != start:
+                        continue
+                base = 1 if (nx, ny) in goal_set else soft_cost(nx, ny)
+                new_cost = cur_cost + max(1, base)
                 nxt = (nx, ny)
-                if nxt in came:
-                    continue
-                # allow stepping onto goal even if occupied; otherwise avoid occupied
-                if nxt not in goal_set and self._is_occupied(nx, ny):
-                    continue
-                came[nxt] = cur
-                q.append(nxt)
+                if new_cost < dist.get(nxt, 10**9):
+                    dist[nxt] = new_cost
+                    came[nxt] = cur
+                    heapq.heappush(pq, (new_cost, nxt))
         return None
 
     def _frontier_targets(self) -> List[Tuple[int, int]]:
@@ -1411,6 +1462,16 @@ class Game:
                 dx, dy = nx - px, ny - py
                 steps = len(path) - 1
                 return ("move", (dx, dy), path[1:7], f"explore ({steps} steps)")
+        # If frontier is empty or unreachable, allow a cautious step into nearby darkness
+        for nx, ny in self._neighbors4(px, py):
+            if not self.map.is_walkable(nx, ny):
+                continue
+            d = self.map.door_at(nx, ny)
+            if d and d.locked and int(self.inventory.get("key", 0)) <= 0:
+                continue
+            if not self.map.explored[ny][nx]:
+                dx, dy = nx - px, ny - py
+                return ("move", (dx, dy), None, "explore (dark step)")
 
         # 5) Otherwise wait
         return ("wait", None, None, "wait")
@@ -1421,6 +1482,8 @@ class Game:
             return False
         from game import TurnDigest  # type: ignore  # local import to avoid circular hinting
         self._digest = TurnDigest()
+        prev_desc = self._auto_target_desc
+        prev_path = tuple(self._auto_path or [])
         kind, move, path, desc = self.bot_choose_action()
 
         # Log decision changes sparsely
@@ -1455,6 +1518,22 @@ class Game:
                 consumed = True
             else:
                 consumed = False
+        # No-op fence: if we kept returning WAIT with no events, force a safe step
+        if kind == "wait":
+            no_events = (not getattr(self._digest, 'enemy_hits', None)) and (not getattr(self._digest, 'player_hits', None)) and (not getattr(self._digest, 'kills_by_player', None))
+            self._auto_wait_streak = self._auto_wait_streak + 1 if no_events else 0
+            if self._auto_wait_streak >= 4:
+                # Force replan and perform a cautious step
+                self._auto_target_desc = None
+                self._auto_path = []
+                self._auto_reason = f"stuck {self._auto_wait_streak}"
+                self.logger.log("Auto: replan (no_progress)")
+                if self._auto_safe_fallback_step():
+                    kind = "move"
+                    consumed = True
+                self._auto_wait_streak = 0
+        else:
+            self._auto_wait_streak = 0
         # Enemy turns and turn advancement
         if consumed:
             self.enemy_turns()
@@ -1467,7 +1546,8 @@ class Game:
                 self._digest = None
             # progress tracking
             new = (self.player.x, self.player.y)
-            if new == old:
+            plan_unchanged = (desc == prev_desc) and (tuple(self._auto_path or []) == prev_path)
+            if new == old and plan_unchanged:
                 self._auto_no_progress_ticks += 1
             else:
                 self._auto_no_progress_ticks = 0
@@ -1479,6 +1559,63 @@ class Game:
                 self.logger.log("Auto: replan (no progress)")
         self.recompute_fov()
         return consumed
+
+    def _auto_safe_fallback_step(self) -> bool:
+        """Pick a reasonably safe adjacent step when stuck/waiting.
+        Avoid archer Aim LOS and immediate adjacency to enemies where possible.
+        Returns True if a move is made.
+        """
+        px, py = self.player.x, self.player.y
+        cand: List[Tuple[int, int, int]] = []  # (score, nx, ny)
+
+        # Archers currently aiming
+        aiming: List[Entity] = []
+        for e in self._visible_enemies():
+            if (e.name or '').lower() == 'archer' and self._get_effect(e, 'Aim') is not None:
+                aiming.append(e)
+
+        def in_aim_los(nx: int, ny: int) -> bool:
+            for a in aiming:
+                if (a.x == nx or a.y == ny) and self.has_los(a.x, a.y, nx, ny, radius=12) and max(abs(a.x-nx), abs(a.y-ny)) >= 2:
+                    return True
+            return False
+
+        vis = self._visible_enemies()
+        for nx, ny in self._neighbors4(px, py):
+            if not self.map.is_walkable(nx, ny):
+                continue
+            d = self.map.door_at(nx, ny)
+            if d and d.locked and int(self.inventory.get('key', 0)) <= 0:
+                continue
+            if self._is_occupied(nx, ny):
+                # Skip for fallback; attacking is handled elsewhere
+                continue
+            score = 0
+            # Prefer stepping into darkness
+            if not self.map.explored[ny][nx]:
+                score -= 1
+            # Penalize adjacency to enemies around the target tile
+            adj = 0
+            for ex, ey in [(nx+1, ny), (nx-1, ny), (nx, ny+1), (nx, ny-1)]:
+                if any(e.is_alive() and (e.x, e.y) == (ex, ey) for e in self.enemies):
+                    adj += 1
+            score += adj * 5
+            # Penalize standing in aiming LOS
+            if in_aim_los(nx, ny):
+                score += 50
+            # Prefer increasing distance to nearest enemy
+            if vis:
+                cur_min = min(abs(px - e.x) + abs(py - e.y) for e in vis)
+                new_min = min(abs(nx - e.x) + abs(ny - e.y) for e in vis)
+                if new_min > cur_min:
+                    score -= 2
+            cand.append((score, nx, ny))
+        if not cand:
+            return False
+        cand.sort(key=lambda t: (t[0], self.rng.random()))
+        _, nx, ny = cand[0]
+        self.move_entity(self.player, nx - px, ny - py)
+        return True
 
     # ---------- Effects & Combat helpers ----------
     def _get_effect(self, ent: Entity, name: str) -> Optional[Dict[str, Any]]:
@@ -1700,6 +1837,13 @@ class Game:
         if self.ansi and self.auto_play:
             auto_line = FG_BRIGHT_GREEN + auto_line + RESET
         pane_top_lines.extend(self._wrap(auto_line, pane_w))
+        # Auto diagnostics line
+        try:
+            ad = self._auto_hud_line()
+            if ad:
+                pane_top_lines.extend(self._wrap(ad, pane_w))
+        except Exception:
+            pass
         # Live patches status line
         try:
             if (_pl is not None):
@@ -1848,6 +1992,30 @@ class Game:
         if parts:
             return "Items: " + ", ".join(parts)
         return ""
+
+    def _auto_hud_line(self) -> str:
+        try:
+            target = "-"
+            desc = self._auto_target_desc or ""
+            dl = desc.lower()
+            if "exit" in dl:
+                target = "Exit"
+            elif dl.startswith("explore"):
+                target = "Frontier"
+            elif dl.startswith("path") and "loot" in dl:
+                target = "Loot"
+            elif dl.startswith("path"):
+                # assume an enemy
+                target = "Enemy"
+            elif dl.startswith("flee"):
+                target = "Flee"
+            elif "avoid los" in dl:
+                target = "Avoid"
+            plen = len(self._auto_path or [])
+            reason = self._auto_reason or "-"
+            return f"Auto: target={target}  path={plen}  reason={reason}"
+        except Exception:
+            return ""
 
     def render_frame(self, frame: str):
         if self.ansi:
